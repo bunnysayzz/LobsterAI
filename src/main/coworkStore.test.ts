@@ -23,8 +23,9 @@ import BetterSqlite3 from 'better-sqlite3';
 import { CoworkSystemMessageKind } from '../common/coworkSystemMessages';
 import { AgentAvatarSvg, DefaultAgentAvatarIcon, encodeAgentAvatarIcon } from '../shared/agent/avatar';
 import { CoworkForkMode } from '../shared/cowork/constants';
-import { ContinuityCapsuleSource } from './libs/agentEngine/coworkContinuityCapsule';
+import { CustomModelUsageRange } from '../shared/usage/constants';
 import { CoworkStore } from './coworkStore';
+import { ContinuityCapsuleSource } from './libs/agentEngine/coworkContinuityCapsule';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -205,6 +206,114 @@ test('getSession returns all messages when one has corrupt metadata', () => {
   // Null metadata → undefined
   const nullMsg = session!.messages.find((m) => m.id === 'msg-null')!;
   expect(nullMsg.metadata).toBeUndefined();
+});
+
+test('custom model usage summary aggregates custom assistant usage and excludes server models', () => {
+  const sid = 'usage-session';
+  insertSession(sid);
+
+  insertMessage('custom-1', sid, 'assistant', 'reply', JSON.stringify({
+    usage: { inputTokens: 10, outputTokens: 5, cacheReadTokens: 2 },
+    model: 'openai/gpt-4.1',
+  }), 1, new Date('2026-06-12T08:00:00').getTime());
+  insertMessage('custom-2', sid, 'assistant', 'reply', JSON.stringify({
+    usage: { inputTokens: 20, outputTokens: 8 },
+    model: 'deepseek/deepseek-chat',
+  }), 2, new Date('2026-06-12T09:00:00').getTime());
+  insertMessage('server-1', sid, 'assistant', 'reply', JSON.stringify({
+    usage: { inputTokens: 1000, outputTokens: 1000 },
+    model: 'lobsterai-server/deepseek-v4',
+  }), 3, new Date('2026-06-12T10:00:00').getTime());
+  insertMessage('user-1', sid, 'user', 'hello', JSON.stringify({
+    usage: { inputTokens: 999, outputTokens: 999 },
+    model: 'openai/gpt-4.1',
+  }), 4, new Date('2026-06-12T11:00:00').getTime());
+
+  const summary = store.getCustomModelUsageSummary({ range: CustomModelUsageRange.All });
+
+  expect(summary.totals.totalTokens).toBe(45);
+  expect(summary.totals.inputTokens).toBe(30);
+  expect(summary.totals.outputTokens).toBe(13);
+  expect(summary.totals.cacheReadTokens).toBe(2);
+  expect(summary.totals.messageCount).toBe(2);
+  expect(summary.totals.sessionCount).toBe(1);
+  expect(summary.byProvider.map(item => item.key)).toEqual(['deepseek', 'openai']);
+  expect(summary.byModel.find(item => item.key === 'lobsterai-server/deepseek-v4')).toBeUndefined();
+});
+
+test('custom model usage summary skips corrupt metadata and empty usage', () => {
+  const sid = 'usage-corrupt-session';
+  insertSession(sid);
+
+  insertMessage('bad', sid, 'assistant', 'reply', '{bad json', 1);
+  insertMessage('empty', sid, 'assistant', 'reply', JSON.stringify({
+    usage: { inputTokens: 0, outputTokens: 0 },
+    model: 'openai/gpt-4.1',
+  }), 2);
+  insertMessage('good', sid, 'assistant', 'reply', JSON.stringify({
+    usage: { inputTokens: 7, outputTokens: 3 },
+    model: 'openai/gpt-4.1',
+  }), 3);
+
+  const summary = store.getCustomModelUsageSummary({ range: CustomModelUsageRange.All });
+
+  expect(summary.totals.totalTokens).toBe(10);
+  expect(summary.totals.messageCount).toBe(1);
+  expect(summary.byModel).toHaveLength(1);
+});
+
+test('custom model usage summary excludes unknown-provider records matching server model ids', () => {
+  const sid = 'usage-server-id-session';
+  insertSession(sid);
+
+  insertMessage('server-id-only', sid, 'assistant', 'reply', JSON.stringify({
+    usage: { inputTokens: 100, outputTokens: 50 },
+    model: 'server-plan-model',
+  }), 1);
+  insertMessage('custom-id-only', sid, 'assistant', 'reply', JSON.stringify({
+    usage: { inputTokens: 7, outputTokens: 3 },
+    model: 'custom-local-model',
+  }), 2);
+
+  const summary = store.getCustomModelUsageSummary({
+    range: CustomModelUsageRange.All,
+    serverModelIds: ['server-plan-model'],
+  });
+
+  expect(summary.totals.totalTokens).toBe(10);
+  expect(summary.byModel.map(item => item.key)).toEqual(['custom-local-model']);
+});
+
+test('custom model usage summary filters by range and sorts model ranking by tokens', () => {
+  const recentSession = 'usage-recent-session';
+  const oldSession = 'usage-old-session';
+  insertSession(recentSession);
+  insertSession(oldSession);
+  const now = Date.now();
+  const old = now - 40 * 24 * 60 * 60 * 1000;
+
+  insertMessage('recent-small', recentSession, 'assistant', 'reply', JSON.stringify({
+    usage: { inputTokens: 5, outputTokens: 5 },
+    model: 'openai/gpt-4.1',
+  }), 1, now);
+  insertMessage('recent-large', recentSession, 'assistant', 'reply', JSON.stringify({
+    usage: { inputTokens: 40, outputTokens: 10 },
+    model: 'deepseek/deepseek-chat',
+  }), 2, now);
+  insertMessage('old-large', oldSession, 'assistant', 'reply', JSON.stringify({
+    usage: { inputTokens: 1000, outputTokens: 1000 },
+    model: 'openai/old-model',
+  }), 1, old);
+
+  const recentSummary = store.getCustomModelUsageSummary({ range: CustomModelUsageRange.ThirtyDays });
+  const allSummary = store.getCustomModelUsageSummary({ range: CustomModelUsageRange.All });
+
+  expect(recentSummary.totals.totalTokens).toBe(60);
+  expect(allSummary.totals.totalTokens).toBe(2060);
+  expect(recentSummary.byModel.map(item => item.key)).toEqual([
+    'deepseek/deepseek-chat',
+    'openai/gpt-4.1',
+  ]);
 });
 
 test('continuity capsule upsert stores one rolling capsule per session', () => {

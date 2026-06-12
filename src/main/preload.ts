@@ -36,6 +36,7 @@ import { McpIpcChannel } from '../shared/mcp/constants';
 import { OpenClawEngineIpc } from '../shared/openclawEngine/constants';
 import { PermissionIpcChannel } from '../shared/permissions/constants';
 import type { Platform } from '../shared/platform';
+import { type CustomModelUsageSummaryRequest,UsageIpcChannel } from '../shared/usage/constants';
 import { NimQrLoginIpc } from './ipcHandlers/nimQrLogin';
 import { OpenClawSessionIpc } from './openclawSession/constants';
 import { OpenClawSessionPolicyIpc } from './openclawSessionPolicy/constants';
@@ -538,6 +539,10 @@ contextBridge.exposeInMainWorld('electron', {
       ipcRenderer.on(CoworkIpcChannel.OpenSessionFromNotification, handler);
       return () => ipcRenderer.removeListener(CoworkIpcChannel.OpenSessionFromNotification, handler);
     },
+  },
+  usage: {
+    getCustomModelUsageSummary: (options?: CustomModelUsageSummaryRequest) =>
+      ipcRenderer.invoke(UsageIpcChannel.GetCustomModelUsageSummary, options),
   },
   dialog: {
     selectDirectory: () => ipcRenderer.invoke('dialog:selectDirectory'),

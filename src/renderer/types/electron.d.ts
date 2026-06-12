@@ -40,6 +40,10 @@ import type {
   OpenClawGatewayRepairErrorCode,
 } from '../../shared/openclawEngine/constants';
 import type { ShellOpenFailureReason } from '../../shared/shell/constants';
+import type {
+  CustomModelUsageSummary,
+  CustomModelUsageSummaryRequest,
+} from '../../shared/usage/constants';
 interface ApiResponse {
   ok: boolean;
   status: number;
@@ -825,6 +829,15 @@ interface IElectronAPI {
     ) => () => void;
     onStreamError: (callback: (data: { sessionId: string; error: string }) => void) => () => void;
     onSessionsChanged: (callback: () => void) => () => void;
+  };
+  usage: {
+    getCustomModelUsageSummary: (
+      options?: CustomModelUsageSummaryRequest,
+    ) => Promise<{
+      success: boolean;
+      summary?: CustomModelUsageSummary;
+      error?: string;
+    }>;
   };
   dialog: {
     selectDirectory: () => Promise<{ success: boolean; path: string | null }>;

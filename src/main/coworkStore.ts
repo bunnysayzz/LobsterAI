@@ -22,6 +22,16 @@ import type {
   KitReference,
   ResolvedKitCapabilities,
 } from '../shared/kit/constants';
+import { OpenClawProviderId, ProviderName } from '../shared/providers';
+import {
+  type CustomModelUsageBreakdownItem,
+  type CustomModelUsageDailyBucket,
+  CustomModelUsageRange,
+  type CustomModelUsageRange as CustomModelUsageRangeType,
+  type CustomModelUsageSummary,
+  type CustomModelUsageSummaryRequest,
+  type CustomModelUsageTotals,
+} from '../shared/usage/constants';
 import {
   ContinuityCapsuleSource,
   type CoworkContinuityCapsule,
@@ -105,6 +115,146 @@ function parseBooleanConfig(value: string | undefined, fallback: boolean): boole
     return false;
   return fallback;
 }
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+interface UsageModelRef {
+  providerKey: string;
+  modelId: string;
+  isServerModel: boolean;
+}
+
+interface CustomModelUsageRow {
+  id: string;
+  session_id: string;
+  metadata: string | null;
+  created_at: number;
+}
+
+interface CustomModelUsageSummaryOptions extends CustomModelUsageSummaryRequest {
+  serverModelIds?: string[];
+}
+
+const createEmptyUsageTotals = (): CustomModelUsageTotals => ({
+  totalTokens: 0,
+  inputTokens: 0,
+  outputTokens: 0,
+  cacheReadTokens: 0,
+  cacheWriteTokens: 0,
+  messageCount: 0,
+  sessionCount: 0,
+});
+
+const createEmptyDailyBucket = (date: string): CustomModelUsageDailyBucket => ({
+  date,
+  totalTokens: 0,
+  inputTokens: 0,
+  outputTokens: 0,
+  cacheReadTokens: 0,
+  cacheWriteTokens: 0,
+  messageCount: 0,
+});
+
+const createEmptyBreakdownItem = (
+  key: string,
+  label: string,
+  providerKey?: string,
+): CustomModelUsageBreakdownItem => ({
+  key,
+  label,
+  ...(providerKey ? { providerKey } : {}),
+  totalTokens: 0,
+  inputTokens: 0,
+  outputTokens: 0,
+  cacheReadTokens: 0,
+  cacheWriteTokens: 0,
+  messageCount: 0,
+  sessionCount: 0,
+});
+
+const readUsageNumber = (value: unknown): number => (
+  typeof value === 'number' && Number.isFinite(value) && value > 0
+    ? value
+    : 0
+);
+
+const formatUsageDay = (timestamp: number): string => {
+  const date = new Date(timestamp);
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+};
+
+const resolveUsageRange = (range: CustomModelUsageRangeType | undefined): CustomModelUsageRangeType => {
+  if (
+    range === CustomModelUsageRange.Today
+    || range === CustomModelUsageRange.SevenDays
+    || range === CustomModelUsageRange.ThirtyDays
+    || range === CustomModelUsageRange.All
+  ) {
+    return range;
+  }
+  return CustomModelUsageRange.ThirtyDays;
+};
+
+const getUsageRangeStart = (range: CustomModelUsageRangeType, now: number): number | null => {
+  if (range === CustomModelUsageRange.All) return null;
+  const start = new Date(now);
+  start.setHours(0, 0, 0, 0);
+  if (range === CustomModelUsageRange.Today) return start.getTime();
+  const days = range === CustomModelUsageRange.SevenDays ? 7 : 30;
+  return start.getTime() - (days - 1) * DAY_MS;
+};
+
+const parseUsageModelRef = (model: unknown): UsageModelRef => {
+  const raw = typeof model === 'string' ? model.trim() : '';
+  if (!raw) {
+    return { providerKey: 'unknown', modelId: 'unknown', isServerModel: false };
+  }
+
+  const slashIndex = raw.indexOf('/');
+  const providerKey = slashIndex > 0 ? raw.slice(0, slashIndex).trim() : 'unknown';
+  const modelId = slashIndex > 0 ? raw.slice(slashIndex + 1).trim() || raw : raw;
+  const isServerModel = providerKey === ProviderName.LobsteraiServer
+    || providerKey === OpenClawProviderId.LobsteraiServer;
+
+  return {
+    providerKey: providerKey || 'unknown',
+    modelId: modelId || raw,
+    isServerModel,
+  };
+};
+
+const addUsageValues = (
+  target: Pick<
+    CustomModelUsageTotals | CustomModelUsageDailyBucket | CustomModelUsageBreakdownItem,
+    'totalTokens' | 'inputTokens' | 'outputTokens' | 'cacheReadTokens' | 'cacheWriteTokens' | 'messageCount'
+  >,
+  usage: {
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheWriteTokens: number;
+    totalTokens: number;
+  },
+): void => {
+  target.inputTokens += usage.inputTokens;
+  target.outputTokens += usage.outputTokens;
+  target.cacheReadTokens += usage.cacheReadTokens;
+  target.cacheWriteTokens += usage.cacheWriteTokens;
+  target.totalTokens += usage.totalTokens;
+  target.messageCount += 1;
+};
+
+const sortUsageBreakdownItems = (
+  items: Iterable<CustomModelUsageBreakdownItem>,
+): CustomModelUsageBreakdownItem[] => (
+  Array.from(items).sort((left, right) => {
+    if (right.totalTokens !== left.totalTokens) return right.totalTokens - left.totalTokens;
+    return left.label.localeCompare(right.label);
+  })
+);
 
 function clampMemoryUserMemoriesMaxItems(value: number): number {
   if (!Number.isFinite(value)) return DEFAULT_MEMORY_USER_MEMORIES_MAX_ITEMS;
@@ -1476,6 +1626,136 @@ export class CoworkStore {
       timestamp: row.created_at,
       metadata: row.metadata ? JSON.parse(row.metadata) : undefined,
     }));
+  }
+
+  getCustomModelUsageSummary(
+    options: CustomModelUsageSummaryOptions = {},
+  ): CustomModelUsageSummary {
+    const range = resolveUsageRange(options.range);
+    const now = Date.now();
+    const rangeStart = getUsageRangeStart(range, now);
+    const serverModelIds = new Set(
+      (options.serverModelIds ?? [])
+        .map(modelId => modelId.trim())
+        .filter(Boolean),
+    );
+    const rows = rangeStart == null
+      ? this.getAll<CustomModelUsageRow>(
+        `
+        SELECT id, session_id, metadata, created_at
+        FROM cowork_messages
+        WHERE type = 'assistant'
+          AND metadata IS NOT NULL
+        ORDER BY created_at ASC
+        `,
+      )
+      : this.getAll<CustomModelUsageRow>(
+        `
+        SELECT id, session_id, metadata, created_at
+        FROM cowork_messages
+        WHERE type = 'assistant'
+          AND metadata IS NOT NULL
+          AND created_at >= ?
+        ORDER BY created_at ASC
+        `,
+        [rangeStart],
+      );
+
+    const totals = createEmptyUsageTotals();
+    const daily = new Map<string, CustomModelUsageDailyBucket>();
+    const byProvider = new Map<string, CustomModelUsageBreakdownItem>();
+    const byModel = new Map<string, CustomModelUsageBreakdownItem>();
+    const totalSessions = new Set<string>();
+    const sessionsByProvider = new Map<string, Set<string>>();
+    const sessionsByModel = new Map<string, Set<string>>();
+
+    for (const row of rows) {
+      let metadata: CoworkMessageMetadata | undefined;
+      try {
+        metadata = row.metadata ? JSON.parse(row.metadata) as CoworkMessageMetadata : undefined;
+      } catch (error) {
+        console.warn(`[Usage] skipped corrupt metadata for message ${row.id}:`, error);
+        continue;
+      }
+      if (!metadata?.usage || typeof metadata.usage !== 'object') continue;
+
+      const modelRef = parseUsageModelRef(metadata.model);
+      if (modelRef.isServerModel) continue;
+      if (modelRef.providerKey === 'unknown' && serverModelIds.has(modelRef.modelId)) continue;
+
+      const inputTokens = readUsageNumber(metadata.usage.inputTokens);
+      const outputTokens = readUsageNumber(metadata.usage.outputTokens);
+      const cacheReadTokens = readUsageNumber(metadata.usage.cacheReadTokens);
+      const cacheWriteTokens = readUsageNumber(metadata.usage.cacheWriteTokens);
+      const totalTokens = inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens;
+      if (totalTokens <= 0) continue;
+
+      const usage = {
+        inputTokens,
+        outputTokens,
+        cacheReadTokens,
+        cacheWriteTokens,
+        totalTokens,
+      };
+
+      addUsageValues(totals, usage);
+      totalSessions.add(row.session_id);
+      totals.firstUsedAt = totals.firstUsedAt === undefined
+        ? row.created_at
+        : Math.min(totals.firstUsedAt, row.created_at);
+      totals.lastUsedAt = totals.lastUsedAt === undefined
+        ? row.created_at
+        : Math.max(totals.lastUsedAt, row.created_at);
+
+      const dayKey = formatUsageDay(row.created_at);
+      const dayBucket = daily.get(dayKey) ?? createEmptyDailyBucket(dayKey);
+      addUsageValues(dayBucket, usage);
+      daily.set(dayKey, dayBucket);
+
+      const providerKey = modelRef.providerKey;
+      const providerItem = byProvider.get(providerKey)
+        ?? createEmptyBreakdownItem(providerKey, providerKey);
+      addUsageValues(providerItem, usage);
+      providerItem.lastUsedAt = providerItem.lastUsedAt === undefined
+        ? row.created_at
+        : Math.max(providerItem.lastUsedAt, row.created_at);
+      byProvider.set(providerKey, providerItem);
+      const providerSessions = sessionsByProvider.get(providerKey) ?? new Set<string>();
+      providerSessions.add(row.session_id);
+      sessionsByProvider.set(providerKey, providerSessions);
+
+      const modelKey = metadata.model?.trim() || modelRef.modelId;
+      const modelLabel = modelRef.providerKey === 'unknown'
+        ? modelRef.modelId
+        : `${modelRef.providerKey}/${modelRef.modelId}`;
+      const modelItem = byModel.get(modelKey)
+        ?? createEmptyBreakdownItem(modelKey, modelLabel, modelRef.providerKey);
+      addUsageValues(modelItem, usage);
+      modelItem.lastUsedAt = modelItem.lastUsedAt === undefined
+        ? row.created_at
+        : Math.max(modelItem.lastUsedAt, row.created_at);
+      byModel.set(modelKey, modelItem);
+      const modelSessions = sessionsByModel.get(modelKey) ?? new Set<string>();
+      modelSessions.add(row.session_id);
+      sessionsByModel.set(modelKey, modelSessions);
+    }
+
+    totals.sessionCount = totalSessions.size;
+    for (const [key, item] of byProvider.entries()) {
+      item.sessionCount = sessionsByProvider.get(key)?.size ?? 0;
+    }
+    for (const [key, item] of byModel.entries()) {
+      item.sessionCount = sessionsByModel.get(key)?.size ?? 0;
+    }
+
+    return {
+      range,
+      generatedAt: now,
+      totals,
+      daily: Array.from(daily.values()).sort((left, right) => left.date.localeCompare(right.date)),
+      byProvider: sortUsageBreakdownItems(byProvider.values()),
+      byModel: sortUsageBreakdownItems(byModel.values()),
+    };
   }
 
   private getSessionMessages(sessionId: string): CoworkMessage[] {

@@ -97,6 +97,7 @@ import { PlatformRegistry } from '../shared/platform';
 import { OpenClawProviderId, ProviderName } from '../shared/providers';
 import type { ShellOpenFailureReason as ShellOpenFailureReasonType } from '../shared/shell/constants';
 import { ShellOpenFailureReason } from '../shared/shell/constants';
+import { type CustomModelUsageSummaryRequest,UsageIpcChannel } from '../shared/usage/constants';
 import { AgentManager } from './agentManager';
 import { APP_NAME, APP_USER_MODEL_ID, DB_FILENAME } from './appConstants';
 import { authQuotaGateStateFromQuota, AuthSubscriptionStatus, createDefaultAuthQuotaGateState, normalizeAuthQuota } from './authQuota';
@@ -6264,6 +6265,29 @@ if (!gotTheLock) {
         return {
           success: false,
           error: error instanceof Error ? error.message : 'Failed to get session messages',
+        };
+      }
+    },
+  );
+
+  ipcMain.handle(
+    UsageIpcChannel.GetCustomModelUsageSummary,
+    async (_event, options?: CustomModelUsageSummaryRequest) => {
+      try {
+        const serverModelIds = getAllServerModelMetadata().map(model => model.modelId);
+        const summary = getCoworkStore().getCustomModelUsageSummary({
+          ...(options ?? {}),
+          serverModelIds,
+        });
+        console.debug(
+          `[Usage] loaded custom model usage summary for range ${summary.range}; counted ${summary.totals.messageCount} message(s) across ${summary.totals.sessionCount} session(s).`,
+        );
+        return { success: true, summary };
+      } catch (error) {
+        console.error('[Usage] failed to load custom model usage summary:', error);
+        return {
+          success: false,
+          error: error instanceof Error ? error.message : 'Failed to load custom model usage summary.',
         };
       }
     },
