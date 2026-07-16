@@ -115,6 +115,11 @@ import ModelSelector, {
 import { ActiveSkillBadge, SkillsPopover } from '../skills';
 import { resolveAgentModelSelection, resolveEffectiveModel, useAgentSelectedModel } from './agentModelSelection';
 import AttachmentCard from './AttachmentCard';
+import {
+  containsClipboardFileUrl,
+  getClipboardFileUrlPath,
+  insertTextAtSelection,
+} from './clipboardPasteUtils';
 import { CoworkUiEvent } from './constants';
 import FolderSelectorPopover from './FolderSelectorPopover';
 import { getCaretPixelPosition } from './getCaretPosition';
@@ -178,6 +183,19 @@ const logCoworkSteer = (
     ? message
     : `${message} error=${error instanceof Error ? error.message : String(error)}`;
   window.electron?.log?.fromRenderer?.(level, 'CoworkSteer', persistedMessage);
+};
+
+const logCoworkClipboardPaste = (
+  level: 'debug' | 'warn',
+  message: string,
+): void => {
+  const taggedMessage = `[CoworkClipboardPaste] ${message}`;
+  if (level === 'warn') {
+    console.warn(taggedMessage);
+  } else {
+    console.debug(taggedMessage);
+  }
+  window.electron?.log?.fromRenderer?.(level, 'CoworkClipboardPaste', message);
 };
 
 const summarizePromptShape = (prompt: string): string => {
@@ -288,35 +306,6 @@ const formatVoiceInputQuotaLimit = (seconds: number): string => {
 const getFileNameFromPath = (path: string): string => {
   const parts = path.split(/[/\\]/);
   return parts[parts.length - 1] || path;
-};
-
-const normalizeClipboardFileUrlPath = (rawPath: string): string | null => {
-  const trimmed = rawPath.trim();
-  if (!trimmed) return null;
-  try {
-    const url = new URL(trimmed);
-    if (url.protocol !== 'file:') return null;
-    let pathname = decodeURIComponent(url.pathname);
-    if (/^\/[A-Za-z]:/.test(pathname)) {
-      pathname = pathname.slice(1);
-    }
-    return pathname || null;
-  } catch {
-    return null;
-  }
-};
-
-const getClipboardFileUrlPath = (clipboardData: DataTransfer | null): string | null => {
-  const uriList = clipboardData?.getData('text/uri-list') ?? '';
-  const uriCandidate = uriList
-    .split(/\r?\n/)
-    .map(line => line.trim())
-    .find(line => line && !line.startsWith('#'));
-  if (uriCandidate) {
-    return normalizeClipboardFileUrlPath(uriCandidate);
-  }
-  const plainText = clipboardData?.getData('text/plain') ?? '';
-  return normalizeClipboardFileUrlPath(plainText);
 };
 
 const SEND_SHORTCUT_OPTIONS = [
@@ -2605,8 +2594,21 @@ const CoworkPromptInput = React.forwardRef<CoworkPromptInputRef, CoworkPromptInp
       return;
     }
 
+    const plainText = event.clipboardData?.getData('text/plain') ?? '';
+    const uriList = event.clipboardData?.getData('text/uri-list') ?? '';
     const clipboardPath = getClipboardFileUrlPath(event.clipboardData);
-    if (!clipboardPath) return;
+    if (!clipboardPath) {
+      if (containsClipboardFileUrl(uriList)) {
+        logCoworkClipboardPaste(
+          'debug',
+          `kept file URI clipboard payload as text because it was not the same single local path; chars=${plainText.length}`,
+        );
+      }
+      return;
+    }
+    const selectionStart = event.currentTarget.selectionStart;
+    const selectionEnd = event.currentTarget.selectionEnd;
+    const targetSteerInput = steerInputActive;
     event.preventDefault();
     void (async () => {
       const stat = await statNativePath(clipboardPath);
@@ -2614,6 +2616,35 @@ const CoworkPromptInput = React.forwardRef<CoworkPromptInputRef, CoworkPromptInp
         console.debug('[CoworkPromptInput] pasted file URL did not resolve to a file or directory', {
           path: clipboardPath,
         });
+        if (plainText) {
+          logCoworkClipboardPaste(
+            'warn',
+            `restoring plain text after pasted file URI validation failed; chars=${plainText.length}`,
+          );
+          let caretPosition = selectionStart + plainText.length;
+          const restorePlainText = (currentValue: string): string => {
+            const insertion = insertTextAtSelection(
+              currentValue,
+              plainText,
+              selectionStart,
+              selectionEnd,
+            );
+            caretPosition = insertion.caretPosition;
+            return insertion.value;
+          };
+          if (targetSteerInput) {
+            setSteerValue(restorePlainText);
+          } else {
+            setValue(restorePlainText);
+          }
+          setMentionPickerOpen(false);
+          requestAnimationFrame(() => {
+            const textarea = textareaRef.current;
+            if (textarea && document.activeElement === textarea) {
+              textarea.setSelectionRange(caretPosition, caretPosition);
+            }
+          });
+        }
         return;
       }
 
@@ -2621,6 +2652,10 @@ const CoworkPromptInput = React.forwardRef<CoworkPromptInputRef, CoworkPromptInp
         path: clipboardPath,
         isDirectory: stat.isDirectory,
       });
+      logCoworkClipboardPaste(
+        'debug',
+        `added validated file URI as ${stat.isDirectory ? 'directory' : 'file'} attachment`,
+      );
       addAttachment(clipboardPath, { isDirectory: stat.isDirectory });
       reportPromptControl('attachment_add_success', {
         source: 'paste',
@@ -2633,7 +2668,7 @@ const CoworkPromptInput = React.forwardRef<CoworkPromptInputRef, CoworkPromptInp
         }]),
       });
     })();
-  }, [addAttachment, disabled, handleIncomingFiles, modelSupportsImage, reportPromptControl, statNativePath, voiceInputLocksEditing]);
+  }, [addAttachment, disabled, handleIncomingFiles, modelSupportsImage, reportPromptControl, statNativePath, steerInputActive, voiceInputLocksEditing]);
 
   const canSubmit = !disabled
     && !isVoiceRecognizing
