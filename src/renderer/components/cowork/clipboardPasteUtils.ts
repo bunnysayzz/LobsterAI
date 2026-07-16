@@ -29,8 +29,17 @@ export const containsClipboardFileUrl = (uriList: string): boolean => uriList
   .map(line => line.trim())
   .some(line => line && !line.startsWith('#') && normalizeClipboardFileUrlPath(line) !== null);
 
-const normalizeLocalPathForComparison = (rawPath: string): string | null => {
-  const trimmed = rawPath.trim();
+const normalizeLocalPathForComparison = (
+  rawPath: string,
+  allowSurroundingQuotes = false,
+): string | null => {
+  const rawTrimmed = rawPath.trim();
+  const trimmed = allowSurroundingQuotes
+    && rawTrimmed.length >= 2
+    && rawTrimmed.startsWith('"')
+    && rawTrimmed.endsWith('"')
+    ? rawTrimmed.slice(1, -1).trim()
+    : rawTrimmed;
   if (!trimmed || /[\r\n]/.test(trimmed)) return null;
 
   const fileUrlPath = normalizeClipboardFileUrlPath(trimmed);
@@ -52,8 +61,15 @@ const normalizeLocalPathForComparison = (rawPath: string): string | null => {
   return normalized;
 };
 
-const clipboardPlainTextMatchesFilePath = (plainText: string, filePath: string): boolean => {
-  const normalizedPlainText = normalizeLocalPathForComparison(plainText);
+export const clipboardPlainTextMatchesLocalPath = (
+  plainText: string,
+  filePath: string,
+  options?: { allowSurroundingQuotes?: boolean },
+): boolean => {
+  const normalizedPlainText = normalizeLocalPathForComparison(
+    plainText,
+    options?.allowSurroundingQuotes === true,
+  );
   const normalizedFilePath = normalizeLocalPathForComparison(filePath);
   return normalizedPlainText !== null
     && normalizedFilePath !== null
@@ -75,7 +91,7 @@ export const getClipboardFileUrlPath = (clipboardData: ClipboardDataReader | nul
     // their plain text contains a compiler error, stack trace, or other prose.
     // Only treat URI-only clipboard data as an attachment when the plain text is
     // empty or represents that same single local path.
-    if (plainText.trim() && !clipboardPlainTextMatchesFilePath(plainText, filePath)) {
+    if (plainText.trim() && !clipboardPlainTextMatchesLocalPath(plainText, filePath)) {
       return null;
     }
     return filePath;

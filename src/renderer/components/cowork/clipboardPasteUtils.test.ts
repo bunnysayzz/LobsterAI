@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'vitest';
 
 import {
+  clipboardPlainTextMatchesLocalPath,
   containsClipboardFileUrl,
   getClipboardFileUrlPath,
   insertTextAtSelection,
@@ -74,6 +75,45 @@ describe('clipboard file URL handling', () => {
     });
 
     expect(getClipboardFileUrlPath(clipboardData)).toBe('/Users/test/My Project');
+  });
+});
+
+describe('clipboard path text matching', () => {
+  test('matches quoted and unquoted Windows paths to the clipboard file path', () => {
+    expect(clipboardPlainTextMatchesLocalPath(
+      '"D:\\securepass\\app\\ProtectionOverlayActivity.java"',
+      'd:/securepass/app/ProtectionOverlayActivity.java',
+      { allowSurroundingQuotes: true },
+    )).toBe(true);
+    expect(clipboardPlainTextMatchesLocalPath(
+      'D:\\securepass\\app\\ProtectionOverlayActivity.java',
+      'D:\\securepass\\app\\ProtectionOverlayActivity.java',
+    )).toBe(true);
+  });
+
+  test('does not unwrap quoted path text unless the caller opts in', () => {
+    expect(clipboardPlainTextMatchesLocalPath(
+      '"D:\\securepass\\app\\ProtectionOverlayActivity.java"',
+      'D:\\securepass\\app\\ProtectionOverlayActivity.java',
+    )).toBe(false);
+  });
+
+  test('matches an editable macOS path to the clipboard file path', () => {
+    expect(clipboardPlainTextMatchesLocalPath(
+      '/Users/test/My Project',
+      '/Users/test/My Project/',
+    )).toBe(true);
+  });
+
+  test('does not match diagnostic prose or a different local path', () => {
+    expect(clipboardPlainTextMatchesLocalPath(
+      'D:\\securepass\\app\\ProtectionOverlayActivity.java:50: error',
+      'D:\\securepass\\app\\ProtectionOverlayActivity.java',
+    )).toBe(false);
+    expect(clipboardPlainTextMatchesLocalPath(
+      'D:\\securepass\\other.java',
+      'D:\\securepass\\ProtectionOverlayActivity.java',
+    )).toBe(false);
   });
 });
 

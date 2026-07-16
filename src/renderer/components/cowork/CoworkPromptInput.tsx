@@ -116,6 +116,7 @@ import { ActiveSkillBadge, SkillsPopover } from '../skills';
 import { resolveAgentModelSelection, resolveEffectiveModel, useAgentSelectedModel } from './agentModelSelection';
 import AttachmentCard from './AttachmentCard';
 import {
+  clipboardPlainTextMatchesLocalPath,
   containsClipboardFileUrl,
   getClipboardFileUrlPath,
   insertTextAtSelection,
@@ -2587,14 +2588,39 @@ const CoworkPromptInput = React.forwardRef<CoworkPromptInputRef, CoworkPromptInp
 
   const handlePaste = useCallback((event: React.ClipboardEvent<HTMLTextAreaElement>) => {
     if (disabled || voiceInputLocksEditing) return;
+    const plainText = event.clipboardData?.getData('text/plain') ?? '';
     const files = Array.from(event.clipboardData?.files ?? []);
     if (files.length > 0) {
+      // Some Windows clipboard sources expose "copy path" as both a File and
+      // text/plain. Preserve editable text only for an exact single-path match;
+      // all other file clipboard payloads keep the existing attachment flow.
+      const shouldInspectEditableWindowsPath = window.electron.platform === 'win32'
+        && files.length === 1
+        && plainText.trim().length > 0;
+      const nativePath = shouldInspectEditableWindowsPath ? getNativeFilePath(files[0]) : null;
+      const plainTextMatchesSingleFile = nativePath !== null
+        && clipboardPlainTextMatchesLocalPath(
+          plainText,
+          nativePath,
+          { allowSurroundingQuotes: true },
+        );
+      const clipboardTypes = Array.from(event.clipboardData?.types ?? []);
+      if (plainTextMatchesSingleFile) {
+        logCoworkClipboardPaste(
+          'debug',
+          `kept pasted Windows file path as editable text; chars=${plainText.length}; types=${clipboardTypes.join(',') || 'none'}`,
+        );
+        return;
+      }
+      logCoworkClipboardPaste(
+        'debug',
+        `processing pasted files as attachments; fileCount=${files.length}; hasPlainText=${plainText.length > 0}; types=${clipboardTypes.join(',') || 'none'}`,
+      );
       event.preventDefault();
       void handleIncomingFiles(files, 'paste');
       return;
     }
 
-    const plainText = event.clipboardData?.getData('text/plain') ?? '';
     const uriList = event.clipboardData?.getData('text/uri-list') ?? '';
     const clipboardPath = getClipboardFileUrlPath(event.clipboardData);
     if (!clipboardPath) {
@@ -2668,7 +2694,7 @@ const CoworkPromptInput = React.forwardRef<CoworkPromptInputRef, CoworkPromptInp
         }]),
       });
     })();
-  }, [addAttachment, disabled, handleIncomingFiles, modelSupportsImage, reportPromptControl, statNativePath, steerInputActive, voiceInputLocksEditing]);
+  }, [addAttachment, disabled, getNativeFilePath, handleIncomingFiles, modelSupportsImage, reportPromptControl, statNativePath, steerInputActive, voiceInputLocksEditing]);
 
   const canSubmit = !disabled
     && !isVoiceRecognizing
