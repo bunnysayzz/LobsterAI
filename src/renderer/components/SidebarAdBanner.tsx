@@ -1,6 +1,7 @@
 import { XMarkIcon } from '@heroicons/react/24/outline';
 import React, { useEffect, useLayoutEffect, useMemo, useState } from 'react';
 
+import { configService } from '../services/config';
 import { getPortalInvitationUrl } from '../services/endpoints';
 import { i18nService } from '../services/i18n';
 import {
@@ -20,6 +21,17 @@ const SidebarAdBanner: React.FC<SidebarAdBannerProps> = ({ hidden = false, onVis
   const [banners, setBanners] = useState<ClientBanner[]>([]);
   const [currentIndex, setCurrentIndex] = useState(0);
   const [hiddenKey, setHiddenKey] = useState<string | null | undefined>(undefined);
+  const [configHidden, setConfigHidden] = useState(false);
+
+  // Check if user has permanently hidden the ad banner in settings
+  useEffect(() => {
+    try {
+      const config = configService.getConfig();
+      setConfigHidden(config.app?.adBannerHidden === true);
+    } catch {
+      // config service may not be ready yet
+    }
+  }, []);
 
   useEffect(() => {
     let isCurrent = true;
@@ -86,7 +98,7 @@ const SidebarAdBanner: React.FC<SidebarAdBannerProps> = ({ hidden = false, onVis
   const visibleIndicatorCount = Math.min(banners.length, 3);
   const activeIndicatorIndex = Math.min(currentBannerIndex, visibleIndicatorCount - 1);
   const isVisible = Boolean(banner && storageKey && hiddenKey !== undefined && hiddenKey !== storageKey);
-  const isDisplayed = isVisible && !hidden;
+  const isDisplayed = isVisible && !hidden && !configHidden;
 
   useLayoutEffect(() => {
     onVisibleChange?.(isDisplayed);
