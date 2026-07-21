@@ -370,6 +370,11 @@ class CoworkService {
     // Error listener
     const errorCleanup = cowork.onStreamError(({ sessionId, error }) => {
       if (this.isStillRunningError(error)) {
+        this.logDiagnostic(
+          'warn',
+          `received a still-running stream signal for session ${sessionId}; keeping renderer streaming state active.`,
+          error,
+        );
         store.dispatch(updateSessionStatus({ sessionId, status: 'running' }));
         this.setCurrentSessionStreaming(sessionId, true, 'stream_error_still_running');
         this.queuedFollowUpCoordinator.handleSessionRunning(sessionId);
@@ -378,6 +383,11 @@ class CoworkService {
         }));
         return;
       }
+      this.logDiagnostic(
+        'error',
+        `received a stream error for session ${sessionId}; updating renderer state.`,
+        error,
+      );
       store.dispatch(updateSessionStatus({ sessionId, status: 'error' }));
       this.setCurrentSessionStreaming(sessionId, false, 'stream_error');
       this.queuedFollowUpCoordinator.handleSessionError(sessionId);
