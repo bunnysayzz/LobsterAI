@@ -6,6 +6,12 @@ import {
 } from '../../common/coworkSystemMessages';
 import type { OpenClawSessionPatch } from '../../common/openclawSession';
 import {
+  type CoworkBtwAbortRequest,
+  CoworkBtwStatus,
+  type CoworkBtwSubmitRequest,
+  normalizeCoworkBtwQuestion,
+} from '../../shared/cowork/btw';
+import {
   COWORK_MESSAGE_PAGE_SIZE,
   COWORK_SESSION_PAGE_SIZE,
   CoworkContextUsageRefreshMode,
@@ -14,6 +20,7 @@ import {
 } from '../../shared/cowork/constants';
 import { normalizeCoworkGoal } from '../../shared/cowork/goal';
 import type { CoworkMessageRailIndexItem } from '../../shared/cowork/rail';
+import type { CoworkSelectedTextSnippet } from '../../shared/cowork/selectedText';
 import {
   type CoworkSteerRequest,
   CoworkSteerStatus,
@@ -23,6 +30,7 @@ import {
   addMessage,
   addPendingSteer,
   addSession,
+  appendBtwEntry,
   appendSessions,
   clearCurrentSession,
   clearPendingPermissions,
@@ -32,6 +40,7 @@ import {
   enqueuePendingPermission,
   finishSessionNavigation as finishSessionNavigationAction,
   markCompactionNotified,
+  openBtwThread,
   prependMessages,
   setConfig,
   setContextCompacting,
@@ -45,6 +54,7 @@ import {
   setRemoteManaged,
   setSessions,
   setStreaming,
+  settleBtwEntry,
   updateCurrentSessionModelOverride,
   updateMessageContent,
   updateSessionGoal,
@@ -73,6 +83,10 @@ import type {
 } from '../types/cowork';
 import { CoworkSessionStatusValue } from '../types/cowork';
 import { CoworkQueuedFollowUpCoordinator } from './coworkQueuedFollowUpCoordinator';
+import {
+  getPreservedMessageWindow,
+  shouldReloadCurrentSessionForChange,
+} from './coworkSessionRefreshPolicy';
 import { i18nService } from './i18n';
 
 const STREAM_ERROR_DUPLICATE_WINDOW_MS = 10_000;
@@ -142,6 +156,7 @@ class CoworkService {
   private contextUsageAutoSuppressedUntilBySessionId = new Map<string, number>();
   private contextUsageBackoffUntil = new Map<string, number>();
   private contextCompactionWatchdogs = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly btwAbortRunIds = new Set<string>();
   private readonly queuedFollowUpCoordinator = new CoworkQueuedFollowUpCoordinator({
     getState: () => store.getState(),
     dispatch: store.dispatch,
@@ -328,6 +343,33 @@ class CoworkService {
       this.streamListenerCleanups.push(goalCleanup);
     }
 
+    const btwResultCleanup = cowork.onStreamBtwResult?.(({ sessionId, result }) => {
+      const existing = store.getState().cowork.btwThreadsBySessionId[sessionId]
+        ?.entries.find(entry => entry.runId === result.runId);
+      if (
+        result.sessionId !== sessionId
+        || !existing
+        || existing.runId !== result.runId
+        || existing.status !== CoworkBtwStatus.Pending
+      ) {
+        this.logDiagnostic(
+          'debug',
+          `[CoworkBtw] ignored result ${result.runId} without a matching renderer request `
+          + `for session ${sessionId}; resultSession=${result.sessionId}; `
+          + `current=${existing?.runId ?? 'none'}; status=${existing?.status ?? 'none'}`,
+        );
+        return;
+      }
+      store.dispatch(settleBtwEntry(result));
+      this.logDiagnostic(
+        'debug',
+        `[CoworkBtw] received ${result.status} result for session ${sessionId}; run=${result.runId}`,
+      );
+    });
+    if (btwResultCleanup) {
+      this.streamListenerCleanups.push(btwResultCleanup);
+    }
+
     const contextMaintenanceCleanup = cowork.onStreamContextMaintenance?.(({ sessionId, active }) => {
       console.log(`[CoworkService] received context maintenance ${active ? 'start' : 'end'} for session ${sessionId}.`);
       store.dispatch(setContextMaintenance({ sessionId, active }));
@@ -407,24 +449,39 @@ class CoworkService {
 
     // Sessions changed listener (new channel sessions discovered by polling,
     // or reconcileWithHistory replaced messages for a channel session)
-    const sessionsChangedCleanup = cowork.onSessionsChanged(() => {
+    const sessionsChangedCleanup = cowork.onSessionsChanged((payload) => {
       const beforeState = store.getState().cowork;
-      console.log('[CoworkService] onSessionsChanged: received IPC event, before sessions:', beforeState.sessions.length, 'sessionIds:', beforeState.sessions.map(s => s.id).slice(0, 5));
+      const changedSessionIds = Array.isArray(payload?.sessionIds) ? payload.sessionIds : [];
+      const changeScope = changedSessionIds.length > 0
+        ? `${changedSessionIds.slice(0, 5).join(',')}${changedSessionIds.length > 5 ? `,+${changedSessionIds.length - 5}` : ''}`
+        : 'unscoped';
+      this.logDiagnostic(
+        'debug',
+        `received sessions change; active=${beforeState.currentSessionId ?? 'none'}; changed=${changeScope}.`,
+      );
       void this.loadSessions().then(() => {
         const state = store.getState().cowork;
-        console.log('[CoworkService] onSessionsChanged: loadSessions complete, total sessions:', state.sessions.length, 'sessionIds:', state.sessions.map(s => s.id).slice(0, 5));
 
-        // Reload the active session's full message list so that messages
-        // replaced by reconcileWithHistory (bulk SQLite replace) are reflected
-        // in the conversation view, not just the sidebar.  Without this,
-        // user messages synced from gateway history would only appear after
-        // the user manually re-enters the conversation.
+        // Reload the active conversation only when that session changed.
+        // Preserve any older history the user already paged in so a scoped
+        // refresh cannot collapse the view back to the default tail window.
         const currentId = state.currentSessionId;
-        if (currentId) {
-          void this.loadSession(currentId);
+        const shouldReloadCurrent = shouldReloadCurrentSessionForChange(currentId, payload);
+        this.logDiagnostic(
+          'debug',
+          `processed sessions change; active=${currentId ?? 'none'}; changed=${changeScope}; reloadActive=${shouldReloadCurrent}.`,
+        );
+        if (currentId && shouldReloadCurrent) {
+          void this.loadSession(currentId, { preserveLoadedRange: true }).catch((error: unknown) => {
+            this.logDiagnostic(
+              'error',
+              `failed to refresh changed active session ${currentId}.`,
+              error,
+            );
+          });
         }
       }).catch((err) => {
-        console.error('[CoworkService] onSessionsChanged: loadSessions FAILED:', err);
+        this.logDiagnostic('error', 'failed to refresh the session list after a sessions change.', err);
       });
     });
     this.streamListenerCleanups.push(sessionsChangedCleanup);
@@ -687,6 +744,7 @@ class CoworkService {
     this.contextUsageInFlightBySessionId.clear();
     this.contextUsageAutoSuppressedUntilBySessionId.clear();
     this.contextUsageBackoffUntil.clear();
+    this.btwAbortRunIds.clear();
   }
 
   async loadSessions(agentId?: string): Promise<void> {
@@ -872,6 +930,7 @@ class CoworkService {
       mediaSelection: options.mediaSelection,
       mediaReferences: options.mediaReferences,
       selectedTextSnippets: options.selectedTextSnippets,
+      browserAnnotations: options.browserAnnotations,
     });
     if (!result.success) {
       this.setCurrentSessionStreaming(options.sessionId, false, 'continue_session_failed');
@@ -991,6 +1050,198 @@ class CoworkService {
         `steer ${options.clientSteerId} failed for session ${options.sessionId}; error=${message}`,
       );
       return false;
+    }
+  }
+
+  async submitBtw(
+    options: CoworkBtwSubmitRequest & {
+      displayQuestion?: string;
+      selectedTextSnippets?: CoworkSelectedTextSnippet[];
+    },
+  ): Promise<boolean> {
+    const cowork = window.electron?.cowork;
+    if (!cowork?.submitBtw || !cowork.onStreamBtwResult) {
+      window.dispatchEvent(new CustomEvent('app:showToast', {
+        detail: i18nService.t('coworkBtwUnavailable'),
+      }));
+      this.logDiagnostic(
+        'warn',
+        `[CoworkBtw] API unavailable for session ${options.sessionId}`,
+      );
+      return false;
+    }
+
+    const question = normalizeCoworkBtwQuestion(options.question);
+    const selectedTextSnippets = (options.selectedTextSnippets ?? []).map(
+      snippet => ({ ...snippet }),
+    );
+    const normalizedDisplayQuestion = normalizeCoworkBtwQuestion(
+      options.displayQuestion ?? options.question,
+    );
+    const displayQuestion = normalizedDisplayQuestion
+      || (selectedTextSnippets.length > 0 ? '' : question);
+    if (!question) {
+      return false;
+    }
+    const existing = store.getState().cowork.btwThreadsBySessionId[options.sessionId]
+      ?.entries.find(entry => entry.status === CoworkBtwStatus.Pending);
+    if (existing) {
+      window.dispatchEvent(new CustomEvent('app:showToast', {
+        detail: i18nService.t('coworkBtwAlreadyPending'),
+      }));
+      this.logDiagnostic(
+        'debug',
+        `[CoworkBtw] ignored duplicate submission for session ${options.sessionId}; pending=${existing.runId}`,
+      );
+      return false;
+    }
+
+    const createdAt = Date.now();
+    store.dispatch(openBtwThread({ sessionId: options.sessionId }));
+    store.dispatch(appendBtwEntry({
+      runId: options.runId,
+      sessionId: options.sessionId,
+      question: displayQuestion,
+      ...(selectedTextSnippets.length > 0 ? { selectedTextSnippets } : {}),
+      status: CoworkBtwStatus.Pending,
+      createdAt,
+    }));
+    this.logDiagnostic(
+      'debug',
+      `[CoworkBtw] submitting run ${options.runId} for session ${options.sessionId}; chars=${question.length}`,
+    );
+
+    try {
+      const result = await cowork.submitBtw({
+        sessionId: options.sessionId,
+        runId: options.runId,
+        question,
+      });
+      if (result.success) {
+        return true;
+      }
+      const current = store.getState().cowork.btwThreadsBySessionId[options.sessionId]
+        ?.entries.find(entry => entry.runId === options.runId);
+      const error = result.error
+        ? classifyError(result.error)
+        : i18nService.t('coworkBtwFailed');
+      if (current?.runId === options.runId && current.status === CoworkBtwStatus.Pending) {
+        store.dispatch(settleBtwEntry({
+          ...current,
+          status: CoworkBtwStatus.Failed,
+          error,
+          completedAt: Date.now(),
+        }));
+      }
+      window.dispatchEvent(new CustomEvent('app:showToast', { detail: error }));
+      this.logDiagnostic(
+        'warn',
+        `[CoworkBtw] rejected run ${options.runId} for session ${options.sessionId}; errorChars=${error.length}`,
+      );
+      return false;
+    } catch (error) {
+      const message = error instanceof Error
+        ? error.message
+        : i18nService.t('coworkBtwFailed');
+      const current = store.getState().cowork.btwThreadsBySessionId[options.sessionId]
+        ?.entries.find(entry => entry.runId === options.runId);
+      if (current?.runId === options.runId && current.status === CoworkBtwStatus.Pending) {
+        store.dispatch(settleBtwEntry({
+          ...current,
+          status: CoworkBtwStatus.Failed,
+          error: message,
+          completedAt: Date.now(),
+        }));
+      }
+      window.dispatchEvent(new CustomEvent('app:showToast', { detail: message }));
+      this.logDiagnostic(
+        'error',
+        `[CoworkBtw] transport failed for run ${options.runId} in session ${options.sessionId}; `
+        + `errorType=${error instanceof Error ? error.name : typeof error}; `
+        + `errorChars=${message.length}`,
+      );
+      return false;
+    }
+  }
+
+  async abortBtw(options: CoworkBtwAbortRequest): Promise<boolean> {
+    const abortKey = JSON.stringify([options.sessionId, options.runId]);
+    const current = store.getState().cowork.btwThreadsBySessionId[options.sessionId]
+      ?.entries.find(entry => entry.runId === options.runId);
+    if (!current || current.status !== CoworkBtwStatus.Pending) {
+      this.logDiagnostic(
+        'debug',
+        `[CoworkBtw] ignored stop without a matching pending renderer request; `
+        + `session=${options.sessionId}; run=${options.runId}`,
+      );
+      return false;
+    }
+    if (this.btwAbortRunIds.has(abortKey)) {
+      this.logDiagnostic(
+        'debug',
+        `[CoworkBtw] ignored duplicate stop; session=${options.sessionId}; run=${options.runId}`,
+      );
+      return false;
+    }
+
+    const cowork = window.electron?.cowork;
+    if (!cowork?.abortBtw) {
+      window.dispatchEvent(new CustomEvent('app:showToast', {
+        detail: i18nService.t('coworkBtwUnavailable'),
+      }));
+      this.logDiagnostic(
+        'warn',
+        `[CoworkBtw] stop API unavailable for session ${options.sessionId}`,
+      );
+      return false;
+    }
+
+    this.btwAbortRunIds.add(abortKey);
+    this.logDiagnostic(
+      'debug',
+      `[CoworkBtw] stopping run ${options.runId} for session ${options.sessionId}`,
+    );
+    try {
+      const result = await cowork.abortBtw(options);
+      if (!result.success) {
+        const message = result.error
+          ? classifyError(result.error)
+          : i18nService.t('coworkBtwStopFailed');
+        window.dispatchEvent(new CustomEvent('app:showToast', { detail: message }));
+        this.logDiagnostic(
+          'warn',
+          `[CoworkBtw] stop rejected for run ${options.runId} in session ${options.sessionId}; `
+          + `errorChars=${message.length}`,
+        );
+        return false;
+      }
+
+      const pending = store.getState().cowork.btwThreadsBySessionId[options.sessionId]
+        ?.entries.find(entry => entry.runId === options.runId);
+      if (result.aborted && pending?.status === CoworkBtwStatus.Pending) {
+        store.dispatch(settleBtwEntry({
+          ...pending,
+          status: CoworkBtwStatus.Stopped,
+          completedAt: Date.now(),
+        }));
+      }
+      this.logDiagnostic(
+        'debug',
+        `[CoworkBtw] stop completed for run ${options.runId} in session ${options.sessionId}; `
+        + `aborted=${result.aborted ? 'yes' : 'no'}`,
+      );
+      return true;
+    } catch (error) {
+      const message = i18nService.t('coworkBtwStopFailed');
+      window.dispatchEvent(new CustomEvent('app:showToast', { detail: message }));
+      this.logDiagnostic(
+        'error',
+        `[CoworkBtw] stop transport failed for run ${options.runId} in session ${options.sessionId}; `
+        + `errorType=${error instanceof Error ? error.name : typeof error}`,
+      );
+      return false;
+    } finally {
+      this.btwAbortRunIds.delete(abortKey);
     }
   }
 
@@ -1266,11 +1517,15 @@ class CoworkService {
     }
   }
 
-  async loadSession(sessionId: string): Promise<CoworkSession | null> {
+  async loadSession(
+    sessionId: string,
+    options: { preserveLoadedRange?: boolean } = {},
+  ): Promise<CoworkSession | null> {
     try {
       const cowork = window.electron?.cowork;
       if (!cowork) return null;
       const requestId = ++this.latestLoadSessionRequestId;
+      const previouslyLoadedSession = store.getState().cowork.currentSession;
 
       const result = await cowork.getSession(sessionId);
       if (result.success && result.session) {
@@ -1283,8 +1538,77 @@ class CoworkService {
           this.logDiagnostic('debug', `ignored stale session load result for session ${sessionId}.`);
           return result.session;
         }
-        store.dispatch(setCurrentSession(result.session));
-        this.setCurrentSessionStreaming(sessionId, result.session.status === 'running', 'load_session_completed');
+        let session = result.session;
+        if (
+          options.preserveLoadedRange
+          && previouslyLoadedSession?.id === sessionId
+          && cowork.getSessionMessages
+        ) {
+          const preservedWindow = getPreservedMessageWindow(
+            previouslyLoadedSession.messagesOffset,
+            session.messagesOffset,
+            session.totalMessages,
+          );
+          if (preservedWindow) {
+            let pageResult;
+            try {
+              pageResult = await cowork.getSessionMessages({
+                sessionId,
+                ...preservedWindow,
+              });
+            } catch (error) {
+              this.logDiagnostic(
+                'warn',
+                `failed to preserve loaded history for session ${sessionId}; keeping the existing view.`,
+                error,
+              );
+              return previouslyLoadedSession;
+            }
+            if (requestId !== this.latestLoadSessionRequestId) {
+              this.logDiagnostic('debug', `ignored stale preserved session load result for session ${sessionId}.`);
+              return session;
+            }
+            if (pageResult.success && pageResult.messages && pageResult.messages.length > 0) {
+              const returnedOffset = pageResult.offset ?? preservedWindow.offset;
+              const returnedEnd = returnedOffset + pageResult.messages.length;
+              const latestLoadedSession = store.getState().cowork.currentSession;
+              const latestLoadedEnd = latestLoadedSession
+                ? latestLoadedSession.messagesOffset + latestLoadedSession.messages.length
+                : 0;
+              if (
+                latestLoadedSession?.id === sessionId
+                && (
+                  latestLoadedSession.messagesOffset < returnedOffset
+                  || latestLoadedEnd > returnedEnd
+                )
+              ) {
+                this.logDiagnostic(
+                  'debug',
+                  `kept a newer in-memory history window for session ${sessionId}; loaded offset=${latestLoadedSession.messagesOffset}, count=${latestLoadedSession.messages.length}; refresh offset=${returnedOffset}, count=${pageResult.messages.length}.`,
+                );
+                return latestLoadedSession;
+              }
+              session = {
+                ...session,
+                messages: pageResult.messages,
+                messagesOffset: returnedOffset,
+                totalMessages: pageResult.total ?? session.totalMessages,
+              };
+              this.logDiagnostic(
+                'debug',
+                `preserved loaded history for session ${sessionId}; returned ${session.messages.length} of ${session.totalMessages} messages from offset ${session.messagesOffset}.`,
+              );
+            } else {
+              this.logDiagnostic(
+                'warn',
+                `failed to preserve loaded history for session ${sessionId}: ${pageResult.error ?? 'empty result'}; keeping the existing view.`,
+              );
+              return previouslyLoadedSession;
+            }
+          }
+        }
+        store.dispatch(setCurrentSession(session));
+        this.setCurrentSessionStreaming(sessionId, session.status === 'running', 'load_session_completed');
         void this.loadSessionMessageRailIndex(sessionId);
         void cowork.markSessionViewed?.(sessionId).catch((error: unknown) => {
           console.warn('[CoworkService] failed to mark session viewed:', error);
@@ -1295,7 +1619,7 @@ class CoworkService {
           store.dispatch(setRemoteManaged(imResult?.remoteManaged ?? false));
         }
 
-        return result.session;
+        return session;
       }
 
       console.error('Failed to load session:', result.error);

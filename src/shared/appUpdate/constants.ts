@@ -24,7 +24,25 @@ export const AppUpdateIpc = {
   CancelDownload: 'appUpdate:cancelDownload',
   InstallReady: 'appUpdate:installReady',
   StateChanged: 'appUpdate:stateChanged',
+  GetCompletedUpdate: 'appUpdate:getCompletedUpdate',
 } as const;
+
+/**
+ * Marker stored in AppUpdateRuntimeState.errorMessage when the user declined
+ * the Windows UAC elevation prompt for a silent install. The OS-provided
+ * exception text is localized, so this stable token is what crosses the IPC
+ * boundary; the renderer maps it to a translated message.
+ */
+export const APP_UPDATE_ELEVATION_DECLINED_ERROR = 'update-elevation-declined';
+
+/**
+ * Stable marker returned when a Windows installer URL fails the HTTPS
+ * transport, credential, port, or extension policy.
+ */
+export const APP_UPDATE_URL_UNTRUSTED_ERROR = 'update-url-untrusted';
+
+/** Stable marker returned when cached installer bytes fail hash validation. */
+export const APP_UPDATE_FILE_INVALID_ERROR = 'update-file-invalid';
 
 export interface ChangeLogEntry {
   title: string;

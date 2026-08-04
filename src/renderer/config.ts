@@ -1,4 +1,4 @@
-import { type ProviderConfig,ProviderRegistry } from '@shared/providers';
+import { type ProviderConfig, ProviderRegistry } from '@shared/providers';
 
 import {
   type BrowserWebAccessConfig,
@@ -82,6 +82,8 @@ export const normalizeFontPreference = (
   return Math.min(max, Math.max(min, Math.round(numericValue)));
 };
 
+export const resolveArtifactAutoPreviewEnabled = (value: unknown): boolean => value !== false;
+
 // 配置类型定义
 export interface AppConfig {
   // API 配置
@@ -95,6 +97,10 @@ export interface AppConfig {
       id: string;
       name: string;
       supportsImage?: boolean;
+      supportsVideo?: boolean;
+      supportsThinking?: boolean;
+      contextWindow?: number;
+      maxTokens?: number;
     }>;
     defaultModel: string;
     defaultModelProvider?: string;
@@ -103,6 +109,8 @@ export interface AppConfig {
   providerModelMigrationVersions?: Record<string, number>;
   // 主题配置
   theme: 'light' | 'dark' | 'system';
+  // Optional for configs created before exact default theme persistence was introduced.
+  themeId?: string;
   // UI 字号配置
   uiFontSize?: number;
   // 代码字体大小配置
@@ -111,6 +119,8 @@ export interface AppConfig {
   language: 'zh' | 'en';
   // 是否使用系统代理
   useSystemProxy: boolean;
+  // 是否在生成可预览内容后自动打开 Artifact 预览面板
+  artifactAutoPreviewEnabled?: boolean;
   // 是否启用 SQLite 自动备份与恢复
   sqliteAutoBackupEnabled?: boolean;
   // 是否允许发送基础产品使用统计
@@ -170,6 +180,7 @@ export const defaultConfig: AppConfig = {
   codeFontSize: FontPreferences.CodeFontSizeDefault,
   language: 'zh',
   useSystemProxy: false,
+  artifactAutoPreviewEnabled: true,
   sqliteAutoBackupEnabled: false,
   usageAnalyticsEnabled: true,
   notificationSettings: defaultNotificationSettings,

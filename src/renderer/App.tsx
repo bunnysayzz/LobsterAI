@@ -19,17 +19,19 @@ import EngineFailureOverlay from './components/cowork/EngineFailureOverlay';
 import EngineStartupOverlay from './components/cowork/EngineStartupOverlay';
 import KitsView from './components/kits/KitsView';
 import { McpView } from './components/mcp';
-import PrivacyDialog from './components/PrivacyDialog';
 import { ScheduledTasksView } from './components/scheduledTasks';
 import Settings, { type SettingsOpenOptions } from './components/Settings';
 import Sidebar from './components/Sidebar';
+import { SitesView } from './components/sites';
 import { SkillsView } from './components/skills';
 import SkinBackdrop, { SkinBackdropVariant } from './components/skin/SkinBackdrop';
 import SkinPresentationScope from './components/skin/SkinPresentationScope';
+import StartupCreditCampaign from './components/StartupCreditCampaign';
 import Toast from './components/Toast';
 import AppUpdateBadge from './components/update/AppUpdateBadge';
 import AppUpdateBlockingPanel from './components/update/AppUpdateBlockingPanel';
 import AppUpdateCard from './components/update/AppUpdateCard';
+import { formatAppUpdateError } from './components/update/appUpdateErrorText';
 import AppUpdateInteractionOverlay from './components/update/AppUpdateInteractionOverlay';
 import {
   isAppUpdateInteractionBlockingStatus,
@@ -38,6 +40,7 @@ import {
 import AppUpdateModal from './components/update/AppUpdateModal';
 import WelcomeDialog from './components/WelcomeDialog';
 import WindowsAppTitleBar from './components/window/WindowsAppTitleBar';
+import WindowTitleBar from './components/window/WindowTitleBar';
 import { defaultConfig, getProviderDisplayName, ShortcutAction } from './config';
 import { SkinProvider } from './providers/SkinProvider';
 import type { ApiConfig } from './services/api';
@@ -45,6 +48,7 @@ import { apiService } from './services/api';
 import { authService } from './services/auth';
 import { configService } from './services/config';
 import { coworkService } from './services/cowork';
+import { isTestModeEnabled } from './services/endpoints';
 import { i18nService } from './services/i18n';
 import { LogReporterAction, reportYdAnalyzer } from './services/logReporter';
 import { scheduledTaskService } from './services/scheduledTask';
@@ -122,7 +126,7 @@ const logAppUpdateRendererLifecycle = (
 const App: React.FC = () => {
   const [showSettings, setShowSettings] = useState(false);
   const [settingsOptions, setSettingsOptions] = useState<SettingsOpenOptions & { requestId: number }>({ requestId: 0 });
-  const [mainView, setMainView] = useState<'cowork' | 'skills' | 'scheduledTasks' | 'kits' | 'mcp'>('cowork');
+  const [mainView, setMainView] = useState<'cowork' | 'skills' | 'scheduledTasks' | 'kits' | 'mcp' | 'sites'>('cowork');
   const [isInitialized, setIsInitialized] = useState(false);
   const [initError, setInitError] = useState<string | null>(null);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
@@ -142,7 +146,7 @@ const App: React.FC = () => {
   const [isUpdateCardExpanded, setIsUpdateCardExpanded] = useState(false);
   const [isUserInitiatedUpdateFlowActive, setIsUserInitiatedUpdateFlowActive] = useState(false);
   const [privacyAgreed, setPrivacyAgreed] = useState<boolean | null>(null);
-  const [showWelcome, setShowWelcome] = useState(false);
+  const [welcomeLoginPending, setWelcomeLoginPending] = useState(false);
   const [enterpriseConfig, setEnterpriseConfig] = useState<{
     ui?: Record<string, 'hide' | 'disable' | 'readonly'>;
     disableUpdate?: boolean;
@@ -402,6 +406,10 @@ const App: React.FC = () => {
     setMainView('mcp');
   }, []);
 
+  const handleShowSites = useCallback(() => {
+    setMainView('sites');
+  }, []);
+
   const handleShowKits = useCallback(() => {
     setMainView('kits');
   }, []);
@@ -484,6 +492,26 @@ const App: React.FC = () => {
     setMainView('cowork');
   }, [dispatch]);
 
+  const handleCreateSiteByChat = useCallback((prompt: string) => {
+    coworkService.clearSession({ restoreAgentSkills: true });
+    dispatch(clearSelection());
+    dispatch(clearDraftAttachments('__home__'));
+    dispatch(clearDraftSelectedTextSnippets('__home__'));
+    dispatch(setActiveKitIds([]));
+    dispatch(setDraftKitIds({ draftKey: '__home__', kitIds: [] }));
+    dispatch(setDraftCollaborationMode({
+      draftKey: '__home__',
+      mode: CoworkCollaborationMode.Default,
+    }));
+    dispatch(setDraftPrompt({ sessionId: '__home__', draft: prompt }));
+    setMainView('cowork');
+    window.setTimeout(() => {
+      window.dispatchEvent(new CustomEvent(CoworkUiEvent.FocusInput, {
+        detail: { clear: false, resetCollaborationMode: true, text: prompt },
+      }));
+    }, 0);
+  }, [dispatch]);
+
   const showToast = useCallback((message: string) => {
     setToastMessage(message);
     if (toastTimerRef.current) {
@@ -526,6 +554,12 @@ const App: React.FC = () => {
             setShowUpdateModal(true);
           }
         }
+        // Silent installs relaunch the app with no visible install step, so
+        // this toast is the only confirmation the update actually happened.
+        const completed = await window.electron.appUpdate.getCompletedUpdate?.();
+        if (mounted && completed?.version) {
+          showToast(`${i18nService.t('updateInstalledToast')} v${completed.version}`);
+        }
       } catch (error) {
         console.error('[App] failed to load initial app update state:', error);
       }
@@ -557,7 +591,11 @@ const App: React.FC = () => {
             .then((installResult) => {
               if (!installResult.success) {
                 stopUserInitiatedUpdateFlow('install-result-failed');
-                showToast(installResult.error || i18nService.t('updateInstallFailed'));
+                showToast(
+                  installResult.error
+                    ? formatAppUpdateError(installResult.error)
+                    : i18nService.t('updateInstallFailed'),
+                );
               }
             })
             .catch((error) => {
@@ -625,7 +663,11 @@ const App: React.FC = () => {
         const installResult = await window.electron.appUpdate.installReady();
         if (!installResult.success) {
           stopUserInitiatedUpdateFlow('install-result-failed');
-          showToast(installResult.error || i18nService.t('updateInstallFailed'));
+          showToast(
+            installResult.error
+              ? formatAppUpdateError(installResult.error)
+              : i18nService.t('updateInstallFailed'),
+          );
         }
       } catch (error) {
         stopUserInitiatedUpdateFlow('install-ipc-failed');
@@ -710,25 +752,39 @@ const App: React.FC = () => {
     await handleConfirmUpdate();
   }, [handleConfirmUpdate]);
 
-  const handlePrivacyAccept = useCallback(async () => {
+  // Continuing from the welcome screen (login or custom model) counts as accepting the agreement.
+  const acceptPrivacyAgreement = useCallback(async () => {
     await window.electron.store.set('privacy_agreed', true);
     setPrivacyAgreed(true);
-    setShowWelcome(true);
   }, []);
 
-  const handlePrivacyReject = useCallback(() => {
-    // 立刻隐藏窗口，让用户感觉立即关闭
-    window.electron.window.close();
-  }, []);
-
+  // Login keeps the welcome gate on screen while the browser flow runs; the
+  // effect below releases the gate only once the user is actually logged in.
   const handleWelcomeLogin = useCallback(async () => {
-    setShowWelcome(false);
-    await authService.login();
+    setWelcomeLoginPending(true);
+    try {
+      await authService.login();
+    } catch (error) {
+      console.error('[App] welcome login failed before browser handoff:', error);
+      setWelcomeLoginPending(false);
+      showToast(i18nService.t('welcomeLoginFailed'));
+    }
+  }, [showToast]);
+  const handleWelcomeCancelLogin = useCallback(() => {
+    setWelcomeLoginPending(false);
   }, []);
-  const handleWelcomeCustomModel = useCallback(() => {
-    setShowWelcome(false);
+  const handleWelcomeCustomModel = useCallback(async () => {
+    await acceptPrivacyAgreement();
     handleShowSettings({ initialTab: 'model' });
-  }, [handleShowSettings]);
+  }, [acceptPrivacyAgreement, handleShowSettings]);
+
+  // Release the first-launch gate once login completes — including when the
+  // browser callback lands after the user tapped back on the welcome screen.
+  useEffect(() => {
+    if (privacyAgreed === false && authUser) {
+      void acceptPrivacyAgreement();
+    }
+  }, [privacyAgreed, authUser, acceptPrivacyAgreement]);
 
   const handlePermissionResponse = useCallback(async (result: CoworkPermissionResult) => {
     if (!pendingPermission) return;
@@ -786,6 +842,11 @@ const App: React.FC = () => {
       });
       dispatch(setAvailableModels(allModels));
     }
+  };
+
+  const handleStartAiSkinFromSettings = (text: string, kitId: string) => {
+    handleCloseSettings();
+    openHomeWithKit(kitId, text);
   };
 
   const isShortcutInputActive = () => {
@@ -1261,6 +1322,35 @@ const App: React.FC = () => {
     );
   }
 
+  if (privacyAgreed === false) {
+    // First-launch gate: render only the welcome screen — no app chrome (title
+    // bar/sidebar) until the agreement is accepted. An invisible drag strip
+    // keeps the frameless window movable; Windows caption buttons stay on top.
+    return (
+      <div className="relative h-screen overflow-hidden">
+        {toastMessage && (
+          <Toast
+            message={toastMessage}
+            closeLabel={i18nService.t('close')}
+            onClose={() => setToastMessage(null)}
+          />
+        )}
+        <WelcomeDialog
+          onLogin={handleWelcomeLogin}
+          loginPending={welcomeLoginPending}
+          onCancelLogin={handleWelcomeCancelLogin}
+          onCustomModel={handleWelcomeCustomModel}
+        />
+        <div className="draggable absolute inset-x-0 top-0 z-[70] h-9" />
+        {isWindows && (
+          <div className="absolute right-0 top-0 z-[80] h-9">
+            <WindowTitleBar inline />
+          </div>
+        )}
+      </div>
+    );
+  }
+
   return (
     <SkinProvider>
       <SkinPresentationScope
@@ -1274,6 +1364,11 @@ const App: React.FC = () => {
           onClose={() => setToastMessage(null)}
         />
       )}
+      {/* The welcome screen renders via the early return above, so agreement
+          alone gates the campaign here (no separate showWelcome flag). */}
+      <StartupCreditCampaign
+        enabled={privacyAgreed === true}
+      />
       {windowsStandaloneTitleBar}
       <div
         className="relative flex flex-1 min-h-0 overflow-hidden"
@@ -1288,6 +1383,7 @@ const App: React.FC = () => {
           onShowScheduledTasks={handleShowScheduledTasks}
           onShowKits={handleShowKits}
           onShowMcp={handleShowMcp}
+          onShowSites={handleShowSites}
           onNewChat={handleNewChat}
           isCollapsed={isSidebarCollapsed}
           onToggleCollapse={handleToggleSidebar}
@@ -1295,6 +1391,7 @@ const App: React.FC = () => {
           updateNotice={!isSidebarCollapsed && !isUpdateInteractionBlocked ? updateCard : null}
           hideAdBanner={isUpdateCardExpanded}
           hideLogin={enterpriseConfig?.ui?.login === 'hide'}
+          hideSites={!isTestModeEnabled() || enterpriseConfig?.ui?.sites === 'hide'}
         />
         <div className={`flex-1 min-w-0 transition-[padding] duration-200 ease-out ${isSidebarCollapsed ? 'pl-1.5' : ''}`}>
           <div
@@ -1338,9 +1435,18 @@ const App: React.FC = () => {
                 onNewChat={handleNewChat}
                 updateBadge={collapsedHeaderUpdateBadge}
               />
+            ) : mainView === 'sites' ? (
+              <SitesView
+                isAuthenticated={Boolean(authUser)}
+                onCreateSiteByChat={handleCreateSiteByChat}
+                isSidebarCollapsed={isSidebarCollapsed}
+                onToggleSidebar={handleToggleSidebar}
+                updateBadge={collapsedHeaderUpdateBadge}
+                readOnly={enterpriseConfig?.ui?.sites === 'readonly'}
+              />
             ) : (
               <CoworkView
-                onRequestAppSettings={privacyAgreed === true && !showWelcome ? handleShowSettings : undefined}
+                onRequestAppSettings={handleShowSettings}
                 onShowSkills={handleShowSkills}
                 onShowKits={handleShowKits}
                 isSidebarCollapsed={isSidebarCollapsed}
@@ -1365,14 +1471,15 @@ const App: React.FC = () => {
       </div>
 
       <EngineFailureOverlay
-        onRequestAppSettings={privacyAgreed === true && !showWelcome ? handleShowSettings : undefined}
-        suspended={showSettings || showUpdateModal || isPermissionModalOpen || privacyAgreed === false || showWelcome}
+        onRequestAppSettings={handleShowSettings}
+        suspended={showSettings || showUpdateModal || isPermissionModalOpen}
       />
 
       {/* 设置窗口显示在所有主内容之上，但不影响主界面的交互 */}
       {showSettings && (
         <Settings
           onClose={handleCloseSettings}
+          onStartAiSkin={handleStartAiSkinFromSettings}
           initialTab={settingsOptions.initialTab}
           initialTabRequestId={settingsOptions.requestId}
           notice={settingsOptions.notice}
@@ -1394,18 +1501,6 @@ const App: React.FC = () => {
         />
       )}
       {permissionModal}
-      {privacyAgreed === false && (
-        <PrivacyDialog
-          onAccept={handlePrivacyAccept}
-          onReject={handlePrivacyReject}
-        />
-      )}
-      {showWelcome && (
-        <WelcomeDialog
-          onLogin={handleWelcomeLogin}
-          onCustomModel={handleWelcomeCustomModel}
-        />
-      )}
       </SkinPresentationScope>
     </SkinProvider>
   );

@@ -181,6 +181,18 @@ test('gateway: client disconnected', () => {
   expect(classifyError('client disconnected')).toBe('coworkErrorGatewayDisconnected');
 });
 
+test('gateway: oversized active transcript has a dedicated recovery message', () => {
+  expect(classifyError(
+    'OPENCLAW_ACTIVE_TRANSCRIPT_OVERSIZED: active OpenClaw transcript is 70000000 bytes',
+  )).toBe('coworkErrorTranscriptOversized');
+});
+
+test('gateway: heap OOM is not classified as a generic disconnect', () => {
+  expect(classifyError(
+    'OpenClaw gateway failed: gatewayFailureKind=heap_out_of_memory; code=134',
+  )).toBe('coworkErrorGatewayHeapOutOfMemory');
+});
+
 test('gateway: session patch timeout before send', () => {
   expect(classifyError('gateway request timeout for sessions.patch')).toBe('coworkGatewaySessionSyncTimeout');
 });
@@ -229,12 +241,30 @@ test('rate: too many requests', () => {
   expect(classifyError('Too many requests, please slow down')).toBe('coworkErrorRateLimit');
 });
 
-test('rate: Anthropic overloaded', () => {
-  expect(classifyError('overloaded_error: Overloaded')).toBe('coworkErrorRateLimit');
+test('capacity: Anthropic overloaded', () => {
+  expect(classifyError('overloaded_error: Overloaded')).toBe('coworkErrorModelOverloaded');
+});
+
+test('capacity: Qwen inner 503 system-capacity throttle wins over too-many-requests wording', () => {
+  expect(classifyError(
+    '<503> InternalError.Algo: An error occurred in model serving, error message is: '
+      + '[Too many requests. Your requests are being throttled due to system capacity limits. Please try again later.]',
+  )).toBe('coworkErrorModelOverloaded');
 });
 
 test('rate: Gemini RESOURCE_EXHAUSTED', () => {
   expect(classifyError('RESOURCE_EXHAUSTED: quota exceeded')).toBe('coworkErrorRateLimit');
+});
+
+// ==================== Model response timeouts ====================
+
+test('model response timeout: OpenClaw idle timeout', () => {
+  expect(classifyError('LLM idle timeout (330s): no response from model'))
+    .toBe('coworkErrorModelResponseTimeout');
+});
+
+test('model response timeout: OpenClaw request timeout', () => {
+  expect(classifyError('LLM request timed out.')).toBe('coworkErrorModelResponseTimeout');
 });
 
 // ==================== Network errors ====================

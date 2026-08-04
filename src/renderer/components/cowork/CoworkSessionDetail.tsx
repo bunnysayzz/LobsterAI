@@ -1,7 +1,6 @@
 import {
   ArchiveBoxArrowDownIcon,
   ArrowDownIcon,
-  ChatBubbleLeftIcon,
   DocumentArrowDownIcon,
   ExclamationTriangleIcon,
   PhotoIcon,
@@ -12,6 +11,13 @@ import { createPortal } from 'react-dom';
 import { useDispatch, useSelector } from 'react-redux';
 
 import { stripGoalCommandPrefixForDisplay } from '../../../common/sessionTitle';
+import {
+  buildCoworkBtwComposerQuestion,
+  buildCoworkBtwContextualQuestion,
+  createCoworkBtwRunId,
+  normalizeCoworkBtwQuestion,
+  resolveCoworkBtwSelectedTextSnippets,
+} from '../../../shared/cowork/btw';
 import { CoworkGoalStatus } from '../../../shared/cowork/goal';
 import type { CoworkImageAttachmentPreview } from '../../../shared/cowork/imageAttachments';
 import {
@@ -25,6 +31,7 @@ import {
   normalizeCoworkSelectedTextSnippets,
 } from '../../../shared/cowork/selectedText';
 import { ShareDeploymentCandidateSource } from '../../../shared/shareDeployment/constants';
+import { resolveArtifactAutoPreviewEnabled } from '../../config';
 import { collectSessionArtifacts, loadDetectedFileArtifact } from '../../services/artifactDetection';
 import {
   dedupeArtifactsForDisplay,
@@ -33,6 +40,7 @@ import {
   normalizeProjectDirectoryForDedup,
   parseMediaTokensFromText,
 } from '../../services/artifactParser';
+import { configService, ConfigServiceEvent } from '../../services/config';
 import { coworkService } from '../../services/cowork';
 import { i18nService } from '../../services/i18n';
 import { getInstalledKitSkillIds } from '../../services/kitCapability';
@@ -66,7 +74,12 @@ import {
 } from '../../store/slices/artifactSlice';
 import {
   addDraftSelectedTextSnippet,
+  clearBtwComposerIfUnchanged,
+  closeBtwThread,
+  openBtwThread,
   PlanConfirmationState,
+  setBtwDraft,
+  setBtwSelectedTextSnippets,
   setDraftCollaborationMode,
   setPlanConfirmationAwaiting,
   setPlanConfirmationHandled,
@@ -92,7 +105,6 @@ import type { MediaAttachmentRef } from '../../types/mediaGeneration';
 import { parseUserMessageForDisplay } from '../../utils/userMessageDisplay';
 import {
   ArtifactPanel,
-  type BrowserAnnotationPayload,
   type LocalServiceDeploymentRequest,
   SubagentPanelContent,
 } from '../artifacts';
@@ -122,6 +134,7 @@ import {
   isWheelScrollingAwayFromBottom,
   shouldAutoScrollForPosition,
 } from './conversationScrollPolicy';
+import CoworkBtwFloatingPanel from './CoworkBtwFloatingPanel';
 import CoworkPromptInput, { type CoworkPromptInputRef } from './CoworkPromptInput';
 import LazyRenderTurn, { clearHeightCache } from './LazyRenderTurn';
 import {
@@ -139,6 +152,7 @@ import {
 import { parseProposedPlanBlock } from './proposedPlanParser';
 import { buildSelectedKitContextPrompt } from './selectedKitContextPrompt';
 import { buildSelectedSkillRoutingPrompt } from './selectedSkillRoutingPrompt';
+import SelectedTextActionToolbar from './SelectedTextActionToolbar';
 import {
   buildCoworkSessionJSON,
   buildCoworkSessionMarkdown,
@@ -158,6 +172,7 @@ interface CoworkSessionDetailProps {
     imageAttachments?: CoworkImageAttachment[],
     mediaReferences?: MediaAttachmentRef[],
     selectedTextSnippets?: CoworkSelectedTextSnippet[],
+    browserAnnotations?: import('@shared/cowork/browserAnnotations').CoworkBrowserAnnotationMessageBatch[],
     collaborationMode?: CoworkCollaborationModeType,
   ) => boolean | void | Promise<boolean | void>;
   onStop: () => void;
@@ -232,6 +247,7 @@ const AutoScrollDetachSource = {
 } as const;
 type AutoScrollDetachSource = typeof AutoScrollDetachSource[keyof typeof AutoScrollDetachSource];
 const AUTO_PREVIEW_ARTIFACT_SETTLE_MS = 600;
+const MAX_AUTO_PREVIEW_HANDLED_TURNS = 128;
 const LOCAL_SERVICE_PROCESS_DIRECTORY_RETRY_DELAY_MS = 900;
 const ARTIFACT_PANEL_TRANSITION_MS = 200;
 const ARTIFACT_PANEL_RESIZE_HANDLE_WIDTH = 4;
@@ -239,7 +255,7 @@ const COWORK_DETAIL_MIN_WIDTH = 480;
 const ARTIFACT_PANEL_MIN_WIDTH_RATIO = 1 / 6;
 const SUBAGENT_PANEL_POLL_INTERVAL_MS = 5_000;
 const INVALID_FILE_NAME_PATTERN = /[<>:"/\\|?*\u0000-\u001F]/g;
-const SELECTED_TEXT_ACTION_HALF_WIDTH = 72;
+const SELECTED_TEXT_ACTION_HALF_WIDTH = 150;
 const SELECTED_TEXT_ACTION_SUPPRESS_MS = 250;
 const EXPANDED_CONVERSATION_PREVIEW_COLLAPSED_MAX_LENGTH = 140;
 const EXPANDED_CONVERSATION_PREVIEW_ITEM_MAX_LENGTH = 520;
@@ -779,9 +795,14 @@ const getSelectedAssistantTextRange = (): SelectedAssistantTextRange | null => {
 const getSelectedTextActionLeft = (rect: DOMRect, container: HTMLDivElement): number => {
   const containerRect = container.getBoundingClientRect();
   const selectionCenterX = rect.left - containerRect.left + rect.width / 2;
+  const availableHalfWidth = Math.max(0, (container.clientWidth - 16) / 2);
+  const actionHalfWidth = Math.min(
+    SELECTED_TEXT_ACTION_HALF_WIDTH,
+    availableHalfWidth,
+  );
   return Math.min(
-    container.clientWidth - SELECTED_TEXT_ACTION_HALF_WIDTH,
-    Math.max(SELECTED_TEXT_ACTION_HALF_WIDTH, selectionCenterX),
+    container.clientWidth - actionHalfWidth,
+    Math.max(actionHalfWidth, selectionCenterX),
   );
 };
 
@@ -1099,12 +1120,32 @@ class ArtifactPanelErrorBoundary extends React.Component<
   }
 }
 
+const MODEL_RESPONSE_WAITING_HINT_DELAY_MS = 30_000;
+
 // Streaming activity bar shown between messages and input
 const StreamingActivityBar: React.FC<{ messages: CoworkMessage[]; isContextMaintenance?: boolean }> = ({
   messages,
   isContextMaintenance = false,
 }) => {
-  const statusText = getStreamingActivityStatusText(messages, isContextMaintenance);
+  const [showLongWaitHint, setShowLongWaitHint] = useState(false);
+
+  useEffect(() => {
+    setShowLongWaitHint(false);
+    if (isContextMaintenance) {
+      return undefined;
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      setShowLongWaitHint(true);
+    }, MODEL_RESPONSE_WAITING_HINT_DELAY_MS);
+    return () => window.clearTimeout(timeoutId);
+  }, [messages, isContextMaintenance]);
+
+  const statusText = getStreamingActivityStatusText(
+    messages,
+    isContextMaintenance,
+    showLongWaitHint,
+  );
 
   return (
     <div className={`shrink-0 animate-fade-in ${COWORK_DETAIL_GUTTER_CLASS}`}>
@@ -1112,7 +1153,7 @@ const StreamingActivityBar: React.FC<{ messages: CoworkMessage[]; isContextMaint
         <div className="streaming-bar" />
         {statusText && (
           <div className="py-1">
-            <span className="text-xs text-secondary">
+            <span className="text-xs text-secondary" aria-live="polite">
               {statusText}
             </span>
           </div>
@@ -1244,6 +1285,9 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
   );
   const planConfirmation = useSelector((state: RootState) =>
     currentSession?.id ? state.cowork.planConfirmations[currentSession.id] : undefined
+  );
+  const btwThread = useSelector((state: RootState) =>
+    currentSession?.id ? state.cowork.btwThreadsBySessionId[currentSession.id] : undefined
   );
   const queuedSteerCount = useSelector((state: RootState) => {
     if (!currentSession?.id) return 0;
@@ -1639,6 +1683,7 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
       undefined,
       undefined,
       undefined,
+      undefined,
       CoworkCollaborationMode.Default,
     );
     if (result === false) {
@@ -1742,6 +1787,113 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
     closeSelectedTextAction({ clearSelection: true });
   }, [addSelectedTextSnippetToDraft, closeSelectedTextAction, selectedTextAction]);
 
+  const handleOpenSelectedTextInSideChat = useCallback(() => {
+    if (!selectedTextAction || !currentSession?.id) return;
+    const sourceMessageId = selectedTextAction.sourceMessageId;
+    const sessionId = currentSession.id;
+    const selectedTextSnippet: CoworkSelectedTextSnippet = {
+      id: `btw-selected-text-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      text: selectedTextAction.text,
+      sourceMessageId,
+      sourceMessageType: CoworkSelectedTextSource.AssistantMessage,
+      sourceId: sourceMessageId,
+      sourceType: CoworkSelectedTextSource.AssistantMessage,
+      createdAt: Date.now(),
+    };
+    const shouldAppendToOpenThread = btwThread?.isOpen === true;
+    const normalized = resolveCoworkBtwSelectedTextSnippets(
+      btwThread?.selectedTextSnippets ?? [],
+      [selectedTextSnippet],
+      shouldAppendToOpenThread,
+    );
+    closeSelectedTextAction({ clearSelection: true });
+    if (!normalized.success) {
+      window.dispatchEvent(new CustomEvent('app:showToast', {
+        detail: i18nService.t(SELECTED_TEXT_ERROR_I18N_KEYS[normalized.error]),
+      }));
+      logDetailDiagnostic(
+        `rejected selected assistant text for side chat in session ${sessionId}; `
+        + `source is ${sourceMessageId}; reason=${normalized.error}`,
+      );
+      return;
+    }
+
+    dispatch(openBtwThread({
+      sessionId,
+      selectedTextSnippets: normalized.snippets,
+    }));
+    reportConversationNavigationAction({
+      actionType: 'selected_text_open_side_chat',
+      params: {
+        ...getConversationControlAnalyticsParams(),
+        sourceType: CoworkSelectedTextSource.AssistantMessage,
+        selectedTextLengthBucket: bucketLength(selectedTextSnippet.text.length),
+        selectedSnippetCount: normalized.snippets.length,
+        selectedTextTotalLengthBucket: bucketLength(normalized.snippets.reduce(
+          (total, snippet) => total + snippet.text.length,
+          0,
+        )),
+      },
+    });
+    logDetailDiagnostic(
+      `opened side chat from selected assistant text for session ${sessionId}; `
+      + `source is ${sourceMessageId}; mode=${shouldAppendToOpenThread ? 'append' : 'replace'}; `
+      + `selected excerpts=${normalized.snippets.length}; `
+      + `characters=${normalized.snippets.reduce((total, snippet) => total + snippet.text.length, 0)}`,
+    );
+  }, [
+    btwThread?.isOpen,
+    btwThread?.selectedTextSnippets,
+    closeSelectedTextAction,
+    currentSession?.id,
+    dispatch,
+    getConversationControlAnalyticsParams,
+    selectedTextAction,
+  ]);
+
+  const handleSubmitBtwDraft = useCallback(() => {
+    if (!btwThread || !currentSession?.id) return;
+    const selectedTextSnippets = btwThread.selectedTextSnippets ?? [];
+    const displayQuestion = normalizeCoworkBtwQuestion(btwThread.draft);
+    const composerQuestion = buildCoworkBtwComposerQuestion(
+      displayQuestion,
+      selectedTextSnippets,
+    );
+    if (!composerQuestion) {
+      window.dispatchEvent(new CustomEvent('app:showToast', {
+        detail: i18nService.t('coworkBtwEmptyQuestion'),
+      }));
+      return;
+    }
+
+    const requestQuestion = buildCoworkBtwContextualQuestion(
+      btwThread.entries,
+      composerQuestion,
+    );
+    const sessionId = currentSession.id;
+    const runId = createCoworkBtwRunId();
+    logDetailDiagnostic(
+      `submitted side-chat draft for session ${sessionId}; run is ${runId}; `
+      + `display characters=${displayQuestion.length}; request characters=${requestQuestion.length}; `
+      + `selected excerpts=${selectedTextSnippets.length}; `
+      + `previous entries=${btwThread.entries.length}`,
+    );
+    void coworkService.submitBtw({
+      sessionId,
+      question: requestQuestion,
+      displayQuestion,
+      selectedTextSnippets,
+      runId,
+    }).then((accepted) => {
+      if (!accepted) return;
+      dispatch(clearBtwComposerIfUnchanged({
+        sessionId,
+        expectedDraft: btwThread.draft,
+        expectedSelectedTextSnippetIds: selectedTextSnippets.map(snippet => snippet.id),
+      }));
+    });
+  }, [btwThread, currentSession?.id, dispatch]);
+
   const handleLocateSelectedText = useCallback((sourceMessageId: string) => {
     const container = scrollContainerRef.current;
     const element = Array.from(
@@ -1828,6 +1980,7 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
   const artifactTabsScrollRef = useRef<HTMLDivElement>(null);
   const contentRowRef = useRef<HTMLDivElement>(null);
   const promptInputAreaRef = useRef<HTMLDivElement>(null);
+  const promptContentAnchorRef = useRef<HTMLDivElement>(null);
   const rawSessionArtifacts = useSelector((state: RootState) =>
     sessionId ? state.artifact.artifactsBySession[sessionId] ?? EMPTY_ARTIFACTS : EMPTY_ARTIFACTS
   );
@@ -1947,6 +2100,11 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
   const previousAutoPreviewMessagesLengthRef = useRef(messagesLength);
   const previousAutoPreviewLatestTurnIdRef = useRef<string | null>(null);
   const [autoPreviewPendingTurnId, setAutoPreviewPendingTurnId] = useState<string | null>(null);
+  const [artifactAutoPreviewEnabled, setArtifactAutoPreviewEnabled] = useState(
+    () => resolveArtifactAutoPreviewEnabled(
+      configService.getConfig().artifactAutoPreviewEnabled,
+    ),
+  );
 
   const getAutoPreviewHandledTurnIds = useCallback((targetSessionId: string): Set<string> => {
     let handled = autoPreviewHandledTurnIdsRef.current[targetSessionId];
@@ -1958,7 +2116,7 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
   }, []);
 
   const clearAutoPreviewArtifactSettleTimer = useCallback(() => {
-    if (autoPreviewArtifactSettleTimerRef.current) {
+    if (autoPreviewArtifactSettleTimerRef.current !== null) {
       window.clearTimeout(autoPreviewArtifactSettleTimerRef.current);
       autoPreviewArtifactSettleTimerRef.current = null;
     }
@@ -1970,7 +2128,13 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
 
   const markAutoPreviewTurnHandled = useCallback((targetSessionId: string, turnId: string) => {
     clearAutoPreviewArtifactSettleTimer();
-    getAutoPreviewHandledTurnIds(targetSessionId).add(turnId);
+    const handledTurnIds = getAutoPreviewHandledTurnIds(targetSessionId);
+    handledTurnIds.add(turnId);
+    while (handledTurnIds.size > MAX_AUTO_PREVIEW_HANDLED_TURNS) {
+      const oldestTurnId = handledTurnIds.values().next().value;
+      if (!oldestTurnId) break;
+      handledTurnIds.delete(oldestTurnId);
+    }
     if (targetSessionId === sessionId && autoPreviewPendingTurnId === turnId) {
       setAutoPreviewPendingTurnId(null);
     }
@@ -1980,6 +2144,27 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
     getAutoPreviewHandledTurnIds,
     sessionId,
   ]);
+
+  useEffect(() => {
+    const syncArtifactAutoPreviewSetting = () => {
+      const enabled = resolveArtifactAutoPreviewEnabled(
+        configService.getConfig().artifactAutoPreviewEnabled,
+      );
+      if (!enabled) {
+        const canceledPendingPreview = autoPreviewArtifactSettleTimerRef.current !== null;
+        clearAutoPreviewArtifactSettleTimer();
+        setAutoPreviewPendingTurnId(null);
+        if (canceledPendingPreview) {
+          console.debug('[ArtifactPreview] canceled pending automatic preview: preference disabled.');
+        }
+      }
+      setArtifactAutoPreviewEnabled(enabled);
+    };
+    window.addEventListener(ConfigServiceEvent.Updated, syncArtifactAutoPreviewSetting);
+    return () => {
+      window.removeEventListener(ConfigServiceEvent.Updated, syncArtifactAutoPreviewSetting);
+    };
+  }, [clearAutoPreviewArtifactSettleTimer]);
 
   useEffect(() => {
     let animationFrame: number | undefined;
@@ -2058,8 +2243,18 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
     setPromptInputAreaHeight(promptInputAreaRef.current?.offsetHeight ?? 0);
   }, []);
 
+  // Keep the prompt and expanded preview overlay in the same pre-paint layout pass.
   useLayoutEffect(() => {
     updatePromptInputAreaHeight();
+  }, [
+    currentSession?.id,
+    isArtifactPanelExpanded,
+    isExpandedConversationPreviewOpen,
+    isExpandedPromptInputHidden,
+    updatePromptInputAreaHeight,
+  ]);
+
+  useLayoutEffect(() => {
     const element = promptInputAreaRef.current;
     window.addEventListener('resize', updatePromptInputAreaHeight);
 
@@ -2075,7 +2270,7 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
       resizeObserver.disconnect();
       window.removeEventListener('resize', updatePromptInputAreaHeight);
     };
-  }, [currentSession?.id, isExpandedPromptInputHidden, updatePromptInputAreaHeight]);
+  }, [currentSession?.id, updatePromptInputAreaHeight]);
 
   useEffect(() => {
     if (isPanelOpen) return;
@@ -4057,9 +4252,6 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
     })();
   }, [dispatch]);
 
-  const handleBrowserAnnotationCaptured = useCallback((payload: BrowserAnnotationPayload) => {
-    promptInputRef.current?.insertBrowserAnnotation(payload);
-  }, []);
 
   const messages = currentSession?.messages;
   const displayItems = useMemo(() => messages ? buildDisplayItems(messages) : [], [messages]);
@@ -4133,8 +4325,14 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
     if (!completedStreamingTurn && !appendedCompletedTurn) return;
 
     if (getAutoPreviewHandledTurnIds(sessionId).has(latestAssistantTurn.id)) return;
+    if (!artifactAutoPreviewEnabled) {
+      clearAutoPreviewArtifactSettleTimer();
+      setCurrentAutoPreviewPendingTurnId(null);
+      return;
+    }
     setCurrentAutoPreviewPendingTurnId(latestAssistantTurn.id);
   }, [
+    artifactAutoPreviewEnabled,
     clearAutoPreviewArtifactSettleTimer,
     getAutoPreviewHandledTurnIds,
     isStreaming,
@@ -4147,6 +4345,12 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
   useEffect(() => {
     if (!sessionId || !autoPreviewPendingTurnId || !currentSession) return;
     if (getAutoPreviewHandledTurnIds(sessionId).has(autoPreviewPendingTurnId)) {
+      clearAutoPreviewArtifactSettleTimer();
+      setCurrentAutoPreviewPendingTurnId(null);
+      return;
+    }
+
+    if (!artifactAutoPreviewEnabled) {
       clearAutoPreviewArtifactSettleTimer();
       setCurrentAutoPreviewPendingTurnId(null);
       return;
@@ -4174,6 +4378,13 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
     autoPreviewArtifactSettleTimerRef.current = window.setTimeout(() => {
       autoPreviewArtifactSettleTimerRef.current = null;
       if (getAutoPreviewHandledTurnIds(sessionId).has(autoPreviewPendingTurnId)) return;
+      if (!resolveArtifactAutoPreviewEnabled(
+        configService.getConfig().artifactAutoPreviewEnabled,
+      )) {
+        setCurrentAutoPreviewPendingTurnId(null);
+        console.debug('[ArtifactPreview] skipped automatic preview: preference disabled.');
+        return;
+      }
 
       switch (getAutoPreviewOpenTarget(artifact)) {
         case ArtifactAutoPreviewOpenTarget.LocalServiceBrowser:
@@ -4194,6 +4405,7 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
 
     return clearAutoPreviewArtifactSettleTimer;
   }, [
+    artifactAutoPreviewEnabled,
     autoPreviewPendingTurnId,
     clearAutoPreviewArtifactSettleTimer,
     currentSession,
@@ -4686,7 +4898,10 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
                   {shouldPinArtifactAddTab ? (
                     <div className="h-full w-9 shrink-0" aria-hidden="true" />
                   ) : (
-                    <div className="z-20 flex h-full shrink-0 items-center bg-background pl-1 pr-1">
+                    <div
+                      data-skin-artifact-add-tab="true"
+                      className="z-20 flex h-full shrink-0 items-center bg-background pl-1 pr-1"
+                    >
                       <button
                         ref={artifactAddButtonRef}
                         type="button"
@@ -4704,7 +4919,10 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
                   </div>
                 </div>
                 {shouldPinArtifactAddTab && (
-                  <div className="absolute inset-y-0 right-0 z-20 flex items-center bg-background pl-1 pr-1">
+                  <div
+                    data-skin-artifact-add-tab="true"
+                    className="absolute inset-y-0 right-0 z-20 flex items-center bg-background pl-1 pr-1"
+                  >
                     <button
                       ref={artifactAddButtonRef}
                       type="button"
@@ -4806,7 +5024,7 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
       )}
 
       {/* Export Options Modal */}
-      {showExportOptions && (
+      {showExportOptions && createPortal(
         <div
           className="fixed inset-0 z-50 flex items-center justify-center modal-backdrop"
           onClick={() => setShowExportOptions(false)}
@@ -4870,7 +5088,8 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
               </button>
             </div>
           </div>
-        </div>
+        </div>,
+        document.body
       )}
 
       {/* Content row: chat + artifact panel */}
@@ -4890,16 +5109,12 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
           style={{ scrollbarGutter: 'stable both-edges' }}
         >
           {selectedTextAction && (
-            <button
-              type="button"
-              data-cowork-selected-text-action
-              onClick={handleAddSelectedText}
-              className="absolute z-40 inline-flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-border bg-surface px-3 py-1.5 text-xs font-medium text-foreground shadow-popover transition-colors hover:bg-surface-raised"
-              style={{ left: selectedTextAction.left, top: selectedTextAction.top }}
-            >
-              <ChatBubbleLeftIcon className="h-3.5 w-3.5 shrink-0 text-secondary" />
-              <span>{i18nService.t('coworkSelectedTextAddToChat')}</span>
-            </button>
+            <SelectedTextActionToolbar
+              left={selectedTextAction.left}
+              top={selectedTextAction.top}
+              onAddToChat={handleAddSelectedText}
+              onAskInSideChat={handleOpenSelectedTextInSideChat}
+            />
           )}
           {isLoadingMoreMessages && (
             <div className="py-2 text-center text-xs dark:text-claude-darkTextSecondary text-claude-textSecondary">
@@ -5264,7 +5479,31 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
             </div>
           </div>
         )}
-        <div className={COWORK_DETAIL_CONTENT_CLASS}>
+        <div ref={promptContentAnchorRef} className={COWORK_DETAIL_CONTENT_CLASS}>
+          {btwThread && (
+            <CoworkBtwFloatingPanel
+              thread={btwThread}
+              promptAnchorRef={promptContentAnchorRef}
+              resolveLocalFilePath={resolveLocalFilePath}
+              onClose={() => dispatch(closeBtwThread(btwThread.sessionId))}
+              onDraftChange={draft => dispatch(setBtwDraft({
+                sessionId: btwThread.sessionId,
+                draft,
+              }))}
+              onSelectedTextSnippetsChange={snippets => dispatch(
+                setBtwSelectedTextSnippets({
+                  sessionId: btwThread.sessionId,
+                  snippets,
+                }),
+              )}
+              onLocateSelectedText={handleLocateSelectedText}
+              onSubmit={handleSubmitBtwDraft}
+              onStop={runId => void coworkService.abortBtw({
+                sessionId: btwThread.sessionId,
+                runId,
+              })}
+            />
+          )}
           {showExternalGoalStatusBar && (
             <div className={`relative z-10 ${showExternalSteerPreview ? 'mb-1.5' : '-mb-px'}`}>
               <div ref={setGoalStatusBarPortalTarget} />
@@ -5396,7 +5635,6 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
               onOpenFileListTab={handleOpenArtifactFileListTab}
               onOpenBrowserTab={handleOpenArtifactBrowserTab}
               onOpenHtmlFileInBrowser={handleOpenHtmlFileInBrowser}
-              onBrowserAnnotationCaptured={handleBrowserAnnotationCaptured}
               subagentPanel={(
                 <SubagentPanelContent
                   subagents={subagents}

@@ -36,6 +36,7 @@ export const COWORK_TEMP_ATTACHMENTS_DIR_NAME = 'attachments';
 export const CoworkIpcChannel = {
   MediaStatusPollUpdate: 'cowork:media:statusPollUpdate',
   ForkSession: 'cowork:session:fork',
+  StopSession: 'cowork:session:stop',
   SubTaskHistory: 'cowork:subTask:history',
   SubagentList: 'cowork:subagent:list',
   SubagentListByAgent: 'cowork:subagent:listByAgent',
@@ -47,8 +48,12 @@ export const CoworkIpcChannel = {
   OpenSessionFromNotification: 'cowork:session:openFromNotification',
   OpenSessionFromNotificationReady: 'cowork:session:openFromNotificationReady',
   GoalCommand: 'cowork:session:goalCommand',
+  SubmitBtw: 'cowork:session:submitBtw',
+  AbortBtw: 'cowork:session:abortBtw',
   SubmitSteer: 'cowork:session:submitSteer',
   SessionModelOverrideChanged: 'cowork:session:modelOverrideChanged',
+  SessionsChanged: 'cowork:sessions:changed',
+  StreamBtwResult: 'cowork:stream:btwResult',
   StreamGoal: 'cowork:stream:goal',
   MemoryReadRaw: 'cowork:memory:readRaw',
   MemoryWriteRaw: 'cowork:memory:writeRaw',
@@ -58,6 +63,10 @@ export const CoworkIpcChannel = {
   TempStorageClean: 'cowork:tempStorage:clean',
 } as const;
 export type CoworkIpcChannel = typeof CoworkIpcChannel[keyof typeof CoworkIpcChannel];
+
+export interface CoworkSessionsChangedPayload {
+  sessionIds: string[];
+}
 
 export const CoworkForkMode = {
   None: 'none',

@@ -1,16 +1,45 @@
 import type { OpenClawSessionPatch } from '../../common/openclawSession';
+import type {
+  ActivityActionResponse,
+  ActivityContextResponse,
+  ActivityHostExecuteActionInput,
+  ActivityHostGetContextInput,
+  ActivityHostGetSlotInput,
+  ActivityResult,
+  ActivitySlotResponse,
+} from '../../shared/activity/constants';
 import type { AppUpdateCheckResult, AppUpdateRuntimeState } from '../../shared/appUpdate/constants';
 import type {
   AsrRealtimeSessionRequest,
   AsrRealtimeSessionResult,
 } from '../../shared/asr/constants';
 import type {
+  AuthLifecycleEvent,
+  AuthLoginResult,
+  AuthRefreshOutcome,
+  AuthSessionChangedEvent,
+  AuthSessionStatus,
+} from '../../shared/auth/constants';
+import type {
   BrowserDiagnosticResult,
   BrowserRuntimeProfile,
 } from '../../shared/browserWebAccess/constants';
 import type {
+  BrowserAnnotationRect,
+  BrowserAnnotationScreenshotRef,
+  CoworkBrowserAnnotationMessageBatch,
+} from '../../shared/cowork/browserAnnotations';
+import type {
+  CoworkBtwAbortRequest,
+  CoworkBtwAbortResponse,
+  CoworkBtwEntry,
+  CoworkBtwSubmitRequest,
+  CoworkBtwSubmitResponse,
+} from '../../shared/cowork/btw';
+import type {
   CoworkContextUsageFailureReason,
   CoworkContextUsageSource,
+  CoworkSessionsChangedPayload,
 } from '../../shared/cowork/constants';
 import type { CoworkGoal } from '../../shared/cowork/goal';
 import type { CoworkMessageRailIndexItem } from '../../shared/cowork/rail';
@@ -60,7 +89,23 @@ import type {
   ShellOpenFailureReason,
 } from '../../shared/shell/constants';
 import type {
+  SiteAnalytics,
+  SiteAnalyticsOptions,
+  SiteDeploymentQuota,
+  SiteDeploymentQuotaOptions,
+  SiteDetail,
+  SiteListData,
+  SiteListOptions,
+  SiteQuotaReservation,
+  SiteQuotaReservationInput,
+  SiteResult,
+  SiteUpdateAccessModeInput,
+  SiteUpdateAccessStatusInput,
+  SiteUpdateTitleInput,
+} from '../../shared/site/constants';
+import type {
   SkinApplyResponse,
+  SkinBindThemeResponse,
   SkinDeactivateResponse,
   SkinDeleteResponse,
   SkinGetActiveResponse,
@@ -651,7 +696,8 @@ interface IElectronAPI {
   skin: {
     getActive: () => Promise<SkinGetActiveResponse>;
     list: () => Promise<SkinListResponse>;
-    apply: (skinId: string) => Promise<SkinApplyResponse>;
+    apply: (skinId: string, boundThemeId?: string) => Promise<SkinApplyResponse>;
+    bindTheme: (skinId: string, themeId: string) => Promise<SkinBindThemeResponse>;
     deactivate: () => Promise<SkinDeactivateResponse>;
     delete: (skinId: string) => Promise<SkinDeleteResponse>;
     onChanged: (callback: () => void) => () => void;
@@ -793,6 +839,7 @@ interface IElectronAPI {
       kitReferences?: KitReference[];
       resolvedKitCapabilities?: ResolvedKitCapabilities;
       selectedTextSnippets?: Array<{ id: string; text: string; sourceMessageId?: string; sourceMessageType?: 'assistant' | 'artifact_markdown' | 'artifact_text'; sourceId?: string; sourceType?: 'assistant' | 'artifact_markdown' | 'artifact_text'; sourceTitle?: string; sourcePath?: string; artifactId?: string; createdAt: number; startOffset?: number; endOffset?: number }>;
+      browserAnnotations?: CoworkBrowserAnnotationMessageBatch[];
       agentId?: string;
       imageAttachments?: Array<{ name: string; mimeType: string; base64Data: string; sizeBytes?: number; localPath?: string; previewMimeType?: string; previewBase64Data?: string }>;
       mediaSelection?: { mode: string; modelId?: string; modelName?: string; imageModelId?: string; videoModelId?: string };
@@ -814,6 +861,7 @@ interface IElectronAPI {
       kitReferences?: KitReference[];
       resolvedKitCapabilities?: ResolvedKitCapabilities;
       selectedTextSnippets?: Array<{ id: string; text: string; sourceMessageId?: string; sourceMessageType?: 'assistant' | 'artifact_markdown' | 'artifact_text'; sourceId?: string; sourceType?: 'assistant' | 'artifact_markdown' | 'artifact_text'; sourceTitle?: string; sourcePath?: string; artifactId?: string; createdAt: number; startOffset?: number; endOffset?: number }>;
+      browserAnnotations?: CoworkBrowserAnnotationMessageBatch[];
       imageAttachments?: Array<{ name: string; mimeType: string; base64Data: string; sizeBytes?: number; localPath?: string; previewMimeType?: string; previewBase64Data?: string }>;
       mediaSelection?: { mode: string; modelId?: string; modelName?: string; imageModelId?: string; videoModelId?: string };
       mediaReferences?: Array<{ token: string; mediaType: string; index: number; fileId: string; fileName: string; mimeType: string; localPath?: string; remoteUrl?: string; dataUrl?: string; role?: string }>;
@@ -824,6 +872,8 @@ interface IElectronAPI {
       code?: string;
       engineStatus?: OpenClawEngineStatus;
     }>;
+    submitBtw: (options: CoworkBtwSubmitRequest) => Promise<CoworkBtwSubmitResponse>;
+    abortBtw: (options: CoworkBtwAbortRequest) => Promise<CoworkBtwAbortResponse>;
     submitSteer: (options: { sessionId: string; text: string; clientSteerId: string }) => Promise<{
       success: boolean;
       status: 'pending' | 'accepted' | 'rejected';
@@ -1068,6 +1118,9 @@ interface IElectronAPI {
     onStreamGoal?: (
       callback: (data: { sessionId: string; goal: CoworkGoal | null }) => void,
     ) => () => void;
+    onStreamBtwResult?: (
+      callback: (data: { sessionId: string; result: CoworkBtwEntry }) => void,
+    ) => () => void;
     onStreamContextMaintenance?: (
       callback: (data: { sessionId: string; active: boolean }) => void,
     ) => () => void;
@@ -1079,7 +1132,9 @@ interface IElectronAPI {
       callback: (data: { sessionId: string; claudeSessionId: string | null }) => void,
     ) => () => void;
     onStreamError: (callback: (data: { sessionId: string; error: string }) => void) => () => void;
-    onSessionsChanged: (callback: () => void) => () => void;
+    onSessionsChanged: (
+      callback: (data?: CoworkSessionsChangedPayload) => void,
+    ) => () => void;
     onSessionModelOverrideChanged?: (
       callback: (data: { sessionId: string; modelOverride: string }) => void,
     ) => () => void;
@@ -1238,6 +1293,25 @@ interface IElectronAPI {
       options: ShareDeploymentDownloadPersistenceInput,
     ) => Promise<ShareDeploymentDownloadPersistenceResult>;
   };
+  sites: {
+    list: (options?: SiteListOptions) => Promise<SiteResult<SiteListData>>;
+    get: (shareId: string) => Promise<SiteResult<SiteDetail>>;
+    updateTitle: (input: SiteUpdateTitleInput) => Promise<SiteResult<SiteDetail>>;
+    updateAccessMode: (input: SiteUpdateAccessModeInput) => Promise<SiteResult<SiteDetail>>;
+    updateAccessStatus: (input: SiteUpdateAccessStatusInput) => Promise<SiteResult<SiteDetail>>;
+    delete: (shareId: string) => Promise<SiteResult<null>>;
+    getAnalytics: (
+      shareId: string,
+      options?: SiteAnalyticsOptions,
+    ) => Promise<SiteResult<SiteAnalytics>>;
+    getDeploymentQuota: (
+      options?: SiteDeploymentQuotaOptions,
+    ) => Promise<SiteResult<SiteDeploymentQuota>>;
+    createQuotaReservation: (
+      input: SiteQuotaReservationInput,
+    ) => Promise<SiteResult<SiteQuotaReservation>>;
+    releaseQuotaReservation: (reservationId: string) => Promise<SiteResult<null>>;
+  };
   asr: {
     createRealtimeSession: (options: AsrRealtimeSessionRequest) => Promise<AsrRealtimeSessionResult>;
   };
@@ -1254,6 +1328,33 @@ interface IElectronAPI {
     destroyPreviewSession: (sessionId: string) => Promise<{ success: boolean }>;
     clearBrowserCookies: () => Promise<{ success: boolean; error?: string }>;
     clearBrowserCache: () => Promise<{ success: boolean; error?: string }>;
+    saveBrowserAnnotationAsset: (input: {
+      draftKey: string;
+      batchId: string;
+      annotationId: string;
+      imageDataUrl: string;
+      viewportWidth: number;
+      viewportHeight: number;
+      targetRect?: BrowserAnnotationRect;
+      markerViewportPoint?: { x: number; y: number };
+      compact?: boolean;
+    }) => Promise<{ success: boolean; asset?: BrowserAnnotationScreenshotRef; error?: string }>;
+    readBrowserAnnotationAsset: (input: {
+      draftKey: string;
+      batchId: string;
+      annotationId: string;
+      assetId: string;
+    }) => Promise<{ success: boolean; dataUrl?: string; byteSize?: number; error?: string }>;
+    deleteBrowserAnnotationAsset: (input: {
+      draftKey: string;
+      batchId: string;
+      annotationId: string;
+      assetId: string;
+    }) => Promise<{ success: boolean; error?: string }>;
+    deleteBrowserAnnotationBatchAssets: (input: {
+      draftKey: string;
+      batchId: string;
+    }) => Promise<{ success: boolean; error?: string }>;
     listLocalWebServices: (options?: ListLocalWebServicesOptions) => Promise<LocalWebService[]>;
   };
   autoLaunch: {
@@ -1284,6 +1385,7 @@ interface IElectronAPI {
     retryDownload: () => Promise<{ success: boolean; state: AppUpdateRuntimeState }>;
     cancelDownload: () => Promise<{ success: boolean; state: AppUpdateRuntimeState }>;
     installReady: () => Promise<{ success: boolean; state: AppUpdateRuntimeState; error?: string }>;
+    getCompletedUpdate: () => Promise<{ version: string | null }>;
     onStateChanged: (callback: (data: AppUpdateRuntimeState) => void) => () => void;
   };
   log: {
@@ -1645,15 +1747,37 @@ interface IElectronAPI {
       error?: string;
     }>;
   };
+  activity: {
+    getSlot: (
+      input: ActivityHostGetSlotInput,
+    ) => Promise<ActivityResult<ActivitySlotResponse>>;
+    getContext: (
+      input: ActivityHostGetContextInput,
+    ) => Promise<ActivityResult<ActivityContextResponse>>;
+    executeAction: (
+      input: ActivityHostExecuteActionInput,
+    ) => Promise<ActivityResult<ActivityActionResponse>>;
+  };
   auth: {
-    login: (loginUrl?: string) => Promise<{ success: boolean; error?: string }>;
+    login: (loginUrl?: string) => Promise<AuthLoginResult>;
     exchange: (
       code: string,
     ) => Promise<{ success: boolean; user?: any; quota?: any; error?: string }>;
-    getUser: () => Promise<{ success: boolean; user?: any; quota?: any }>;
+    getUser: () => Promise<{
+      success: boolean;
+      status?: AuthSessionStatus;
+      hasCredentials?: boolean;
+      cachedUser?: any;
+      user?: any;
+      quota?: any;
+    }>;
     getQuota: () => Promise<{ success: boolean; quota?: any }>;
     logout: () => Promise<{ success: boolean }>;
-    refreshToken: () => Promise<{ success: boolean; accessToken?: string }>;
+    refreshToken: () => Promise<{
+      success: boolean;
+      accessToken?: string;
+      outcome?: AuthRefreshOutcome;
+    }>;
     getAccessToken: () => Promise<string | null>;
     getModels: () => Promise<{
       success: boolean;
@@ -1662,9 +1786,14 @@ interface IElectronAPI {
         modelName: string;
         provider: string;
         apiFormat: string;
+        runtimeProfile?: import('../../shared/providers/modelRuntimeProfiles').ModelRuntimeProfile;
         supportsImage?: boolean;
+        supportsVideo?: boolean;
         supportsThinking?: boolean;
+        supportsToolCalling?: boolean;
+        agenticReady?: boolean;
         contextWindow?: number;
+        maxTokens?: number;
         explicitContextCache?: boolean;
         costMultiplier?: number;
         description?: string;
@@ -1694,6 +1823,8 @@ interface IElectronAPI {
     getPendingCallback: () => Promise<string | null>;
     onCallback: (callback: (data: { code: string }) => void) => () => void;
     onQuotaChanged: (callback: () => void) => () => void;
+    onSessionChanged: (callback: (event: AuthSessionChangedEvent) => void) => () => void;
+    onLifecycleEvent: (callback: (event: AuthLifecycleEvent) => void) => () => void;
   };
   media: {
     getModels: (type: 'image' | 'video') => Promise<{ success: boolean; models?: Array<{ modelId: string; displayName: string; provider: string; mediaType: string; generationTimeout: number; pricing: Record<string, unknown> }>; error?: string }>;
@@ -1711,7 +1842,7 @@ interface IElectronAPI {
     send: (status: 'online' | 'offline') => void;
   };
   auth: {
-    login: (loginUrl?: string) => Promise<{ success: boolean; error?: string }>;
+    login: (loginUrl?: string) => Promise<AuthLoginResult>;
     exchange: (code: string) => Promise<{
       success: boolean;
       user?: import('../store/slices/authSlice').UserProfile;
@@ -1726,6 +1857,9 @@ interface IElectronAPI {
     }>;
     getUser: () => Promise<{
       success: boolean;
+      status?: AuthSessionStatus;
+      hasCredentials?: boolean;
+      cachedUser?: import('../store/slices/authSlice').UserProfile | null;
       user?: import('../store/slices/authSlice').UserProfile;
       quota?: {
         planName: string;
@@ -1746,10 +1880,17 @@ interface IElectronAPI {
       };
     }>;
     logout: () => Promise<{ success: boolean }>;
-    refreshToken: () => Promise<{ success: boolean; accessToken?: string }>;
+    refreshToken: () => Promise<{
+      success: boolean;
+      accessToken?: string;
+      outcome?: AuthRefreshOutcome;
+    }>;
     getAccessToken: () => Promise<string | null>;
     getPendingCallback: () => Promise<string | null>;
     onCallback: (callback: (data: { code: string }) => void) => () => void;
+    onQuotaChanged: (callback: () => void) => () => void;
+    onSessionChanged: (callback: (event: AuthSessionChangedEvent) => void) => () => void;
+    onLifecycleEvent: (callback: (event: AuthLifecycleEvent) => void) => () => void;
   };
   qwen: Record<string, never>;
   feishu: {
