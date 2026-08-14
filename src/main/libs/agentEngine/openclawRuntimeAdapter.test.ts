@@ -30,6 +30,8 @@ import {
 } from '../../../shared/cowork/btw';
 import { CoworkSelectedTextSource } from '../../../shared/cowork/selectedText';
 import { OpenClawTranscriptSafetyLimit } from '../../../shared/openclawTranscript/constants';
+import { t } from '../../i18n';
+import { OpenClawChannelSessionSync } from '../openclawChannelSessionSync';
 import {
   __openClawTokenProxyTestUtils,
   consumeRecentOpenClawTokenProxyQuotaError,
@@ -38,9 +40,11 @@ import { ContinuityCapsuleSource } from './coworkContinuityCapsule';
 import {
   buildOpenClawChatSendPayloadTooLargeError,
   buildOpenClawRuntimeErrorDetail,
+  buildRuntimeErrorMetadata,
   ensurePlanModeProposedPlanBlock,
   estimateOpenClawChatSendFrameBytes,
   isIncompleteStopReason,
+  isOpenClawToolLoopBlockedResultText,
   isPlanModeResponseComplete,
   isPlanModeSafeExecCommand,
   isSignificantAssistantStreamReset,
@@ -48,7 +52,9 @@ import {
   OPENCLAW_CHAT_SEND_PAYLOAD_SAFE_LIMIT_BYTES,
   OpenClawRuntimeAdapter,
   pickPersistedAssistantSegment,
+  resolveOpenClawRuntimeError,
   resolveOpenClawRuntimeErrorMessage,
+  resolveOpenClawToolLoopErrorOverride,
   resolveToolEventIsError,
 } from './openclawRuntimeAdapter';
 
@@ -627,6 +633,41 @@ test('resolveOpenClawRuntimeErrorMessage classifies raw LobsterAI quota errors',
   expect(resolveOpenClawRuntimeErrorMessage('本月积分已用完')).toContain('积分额度已用完');
 });
 
+test('resolveOpenClawRuntimeError keeps structured enterprise quota reason', () => {
+  expect(resolveOpenClawRuntimeError('LLM request failed.', {
+    errorCode: '41606',
+    rawErrorPreview: '41606 member monthly quota exhausted',
+  })).toEqual({
+    message: expect.stringContaining('成员周期额度'),
+    enterpriseQuotaError: {
+      code: 41606,
+      reason: 'member_monthly_quota_exhausted',
+    },
+  });
+});
+
+test('buildRuntimeErrorMetadata preserves technical details with enterprise quota fields', () => {
+  const errorDetail = {
+    rawErrorMessage: 'LLM request failed.',
+    provider: 'lobsterai-server',
+    httpCode: '402',
+  };
+
+  expect(buildRuntimeErrorMetadata({
+    message: 'Team credits have been used up.',
+    enterpriseQuotaError: {
+      code: 41607,
+      reason: 'enterprise_pool_exhausted',
+    },
+    errorDetail,
+  })).toEqual({
+    error: 'Team credits have been used up.',
+    errorDetail,
+    enterpriseErrorCode: 41607,
+    enterpriseQuotaReason: 'enterprise_pool_exhausted',
+  });
+});
+
 test('resolveOpenClawRuntimeErrorMessage classifies generic error from safe OAuth metadata', () => {
   expect(resolveOpenClawRuntimeErrorMessage('LLM request failed.', {
     provider: 'minimax-portal',
@@ -813,6 +854,73 @@ test('buildOpenClawRuntimeErrorDetail falls back to the turn model ref when meta
     modelSource: 'coding-plan',
   });
   expect(detail?.providerDisplayName).toBeUndefined();
+});
+
+// Real veto strings produced by the pinned OpenClaw runtime's loop detection.
+const TOOL_LOOP_POLL_BLOCK_TEXT =
+  'CRITICAL: Called process with identical arguments and no progress 10 times. '
+  + 'This appears to be a stuck polling loop. Session execution blocked to prevent resource waste.';
+const TOOL_LOOP_BREAKER_BLOCK_TEXT =
+  'CRITICAL: process has repeated identical no-progress outcomes 30 times. '
+  + 'Session execution blocked by global circuit breaker to prevent runaway loops.';
+const TOOL_LOOP_ABORTED_BLOCK_TEXT =
+  'CRITICAL: exec has returned aborted outcomes 8 times for identical arguments. '
+  + 'Session execution blocked to prevent runaway retry loops.';
+const OPENCLAW_INCOMPLETE_TURN_ERROR_TEXT =
+  '⚠️ Agent couldn\'t generate a response. '
+  + 'Note: some tool actions may have already been executed — please verify before retrying.';
+
+// zz-openclaw-tool-loop-soft-vetoes.patch texts: soft vetoes no longer claim a
+// session block (the run continues), while escalated vetoes append the
+// hard-stop copy before terminating.
+const TOOL_LOOP_SOFT_VETO_TEXT =
+  'CRITICAL: Called process with identical arguments and no progress 10 times, '
+  + 'so this call was blocked as a stuck polling loop. Wait significantly longer before checking '
+  + 'again, try a different approach, or report the current status to the user. '
+  + 'Repeating the same blocked call will end this run.';
+const TOOL_LOOP_ESCALATED_VETO_TEXT =
+  `${TOOL_LOOP_SOFT_VETO_TEXT} Session execution blocked to prevent resource waste.`;
+
+test('isOpenClawToolLoopBlockedResultText matches critical loop vetoes only', () => {
+  expect(isOpenClawToolLoopBlockedResultText(TOOL_LOOP_POLL_BLOCK_TEXT)).toBe(true);
+  expect(isOpenClawToolLoopBlockedResultText(TOOL_LOOP_BREAKER_BLOCK_TEXT)).toBe(true);
+  expect(isOpenClawToolLoopBlockedResultText(TOOL_LOOP_ABORTED_BLOCK_TEXT)).toBe(true);
+  expect(isOpenClawToolLoopBlockedResultText(`  ${TOOL_LOOP_POLL_BLOCK_TEXT}  `)).toBe(true);
+  expect(isOpenClawToolLoopBlockedResultText(TOOL_LOOP_ESCALATED_VETO_TEXT)).toBe(true);
+
+  // Soft vetoes leave the run alive, so they must not arm the terminated-turn
+  // error override.
+  expect(isOpenClawToolLoopBlockedResultText(TOOL_LOOP_SOFT_VETO_TEXT)).toBe(false);
+
+  // Warnings and normal tool output must not be treated as a blocking veto.
+  expect(isOpenClawToolLoopBlockedResultText(
+    'WARNING: You have called process 9 times with identical arguments and no progress. '
+    + 'Stop polling and either (1) increase wait time between checks, or (2) report the task as failed.',
+  )).toBe(false);
+  expect(isOpenClawToolLoopBlockedResultText(
+    'CRITICAL: attempted unavailable tool web_search 6 times. Stop retrying that missing tool and answer without it.',
+  )).toBe(false);
+  expect(isOpenClawToolLoopBlockedResultText('build output line 1\nline 2')).toBe(false);
+});
+
+test('resolveOpenClawToolLoopErrorOverride rewrites the generic incomplete-turn error', () => {
+  const override = resolveOpenClawToolLoopErrorOverride(
+    TOOL_LOOP_POLL_BLOCK_TEXT,
+    OPENCLAW_INCOMPLETE_TURN_ERROR_TEXT,
+  );
+
+  expect(override).not.toBeNull();
+  expect(override?.errorMessage).toBe(t('coworkErrorToolLoopBlocked'));
+  // The technical detail keeps both the original copy and the veto reason.
+  expect(override?.detailRawErrorMessage).toContain("Agent couldn't generate a response");
+  expect(override?.detailRawErrorMessage).toContain(TOOL_LOOP_POLL_BLOCK_TEXT);
+});
+
+test('resolveOpenClawToolLoopErrorOverride leaves unrelated errors untouched', () => {
+  // No loop veto seen in the turn.
+  expect(resolveOpenClawToolLoopErrorOverride(undefined, OPENCLAW_INCOMPLETE_TURN_ERROR_TEXT)).toBeNull();
+  // Loop veto seen, but the run failed for a different reason.
+  expect(resolveOpenClawToolLoopErrorOverride(TOOL_LOOP_POLL_BLOCK_TEXT, 'LLM request failed.')).toBeNull();
 });
 
 test('estimateOpenClawChatSendFrameBytes measures the full RPC frame as UTF-8 JSON', () => {
@@ -1709,11 +1817,13 @@ test('resolveToolEventIsError reads nested tool result errors', () => {
 function createPatchAdapter(options?: {
   isChannelSession?: boolean;
   persistedSessionKey?: string | null;
+  scheduledTaskId?: string | null;
 }) {
   const session = {
     id: 'session-1',
     title: 'Test Session',
     claudeSessionId: null,
+    scheduledTaskId: options?.scheduledTaskId ?? null,
     status: 'completed',
     pinned: false,
     cwd: '',
@@ -1760,7 +1870,7 @@ function createPatchAdapter(options?: {
       }),
     };
   }
-  return { adapter, requests };
+  return { adapter, requests, session };
 }
 
 test('disconnectGatewayClient rejects pending gateway readiness immediately', async () => {
@@ -1909,6 +2019,31 @@ test('patchSession uses the persisted IM channel session key after runtime cache
   ]);
 });
 
+test('patchSession sends model and thinking level atomically', async () => {
+  const { adapter, requests } = createPatchAdapter({
+    isChannelSession: false,
+    persistedSessionKey: null,
+  });
+
+  const result = await adapter.patchSession('session-1', {
+    model: 'lobsterai-server/deepseek-v4-flash',
+    thinkingLevel: 'max',
+  });
+
+  expect(requests[0]).toEqual({
+    method: 'sessions.patch',
+    params: {
+      key: 'agent:main:lobsterai:session-1',
+      model: 'lobsterai-server/deepseek-v4-flash',
+      thinkingLevel: 'max',
+    },
+  });
+  expect(result).toEqual({
+    modelOverride: 'lobsterai-server/deepseek-v4-flash',
+    thinkingLevel: 'max',
+  });
+});
+
 test('patchSession rejects IM channel sessions when the real OpenClaw key is missing', async () => {
   const { adapter, requests } = createPatchAdapter({
     isChannelSession: true,
@@ -1936,6 +2071,95 @@ test('patchSession keeps managed-key fallback for normal Cowork sessions', async
       model: 'moonshot/kimi-k2.6',
     },
   });
+});
+
+test('interactive RPCs use the managed key for an idle scheduled session and its raw key while active', async () => {
+  const { adapter, requests } = createPatchAdapter({
+    scheduledTaskId: 'daily-monitor',
+  });
+  const cronRunKey = 'agent:main:cron:daily-monitor:run:run-42';
+  const managedKey = 'agent:main:lobsterai:session-1';
+  adapter.rememberSessionKey('session-1', cronRunKey);
+
+  await adapter.patchSession('session-1', { model: 'moonshot/kimi-k2.6' });
+  await adapter.compactContext('session-1');
+
+  expect(requests[0]?.params.key).toBe(managedKey);
+  expect(requests[1]).toEqual({
+    method: 'sessions.compact',
+    params: { key: managedKey },
+  });
+  expect(requests[2]?.params.search).toBe(managedKey);
+
+  adapter.activeTurns.set(
+    'session-1',
+    createActiveTurn('session-1', cronRunKey, 'run-42'),
+  );
+  await adapter.patchSession('session-1', { model: 'moonshot/kimi-k2.6' });
+
+  expect(requests.at(-1)?.params.key).toBe(cronRunKey);
+});
+
+test('pollChannelSessions recovers a missed cron event without retaining run-scoped keys', async () => {
+  const sessionKey = 'agent:ops:cron:daily-monitor:run:run-42';
+  const { session, store } = createReconcileStore([], {
+    sessionId: 'cron-session-1',
+  });
+  const adapter = new OpenClawRuntimeAdapter(store, {});
+  const requests: Array<{ method: string; params?: unknown }> = [];
+  adapter.gatewayClient = {
+    start: () => {},
+    stop: () => {},
+    request: async (method: string, params?: unknown) => {
+      requests.push({ method, params });
+      if (method === 'sessions.list') {
+        return { sessions: [{ key: sessionKey, hasActiveRun: false }] };
+      }
+      return { messages: [] };
+    },
+  };
+  const channelSync = new OpenClawChannelSessionSync({
+    coworkStore: {
+      ...store,
+      getSessionIdByScheduledTaskId: () => session.id,
+      createSession: () => {
+        throw new Error('poll should reuse the persisted cron session');
+      },
+    } as never,
+    imStore: {} as never,
+    getDefaultCwd: () => '/repo/ops',
+  });
+  adapter.channelSessionSync = channelSync;
+  adapter.knownChannelSessionIds.add(session.id);
+  adapter.fullySyncedSessions.add(session.id);
+
+  await adapter.pollChannelSessions();
+
+  const channelSyncState = channelSync as unknown as { rejectedKeys: Set<string> };
+  expect(channelSyncState.rejectedKeys.size).toBe(0);
+  expect(adapter.sessionIdBySessionKey.get(sessionKey)).toBe(session.id);
+  expect(adapter.latestCronSessionKeyByCacheKey.get('agent:ops:cron:daily-monitor')).toBe(sessionKey);
+  expect(requests.map(request => request.method)).toEqual(['sessions.list', 'chat.history']);
+});
+
+test('cron session routing retains only the latest real gateway run key per job', () => {
+  const { session, store } = createReconcileStore([], {
+    sessionId: 'cron-session-1',
+  });
+  const adapter = new OpenClawRuntimeAdapter(store, {});
+  const firstRunKey = 'agent:ops:cron:daily-monitor:run:run-1';
+  const latestRunKey = 'agent:ops:cron:daily-monitor:run:run-2';
+
+  adapter.rememberSessionKey(session.id, firstRunKey);
+  adapter.rememberSessionKey(session.id, latestRunKey);
+
+  expect(adapter.sessionIdBySessionKey.has(firstRunKey)).toBe(false);
+  expect(adapter.resolveSessionIdBySessionKey(firstRunKey)).toBe(session.id);
+  expect(adapter.getSessionKeysForSession(session.id)).toContain(latestRunKey);
+  expect(adapter.getSessionKeysForSession(session.id)).not.toContain(firstRunKey);
+  expect(adapter.getSessionKeysForSession(session.id)).not.toContain(
+    'agent:ops:cron:daily-monitor',
+  );
 });
 
 test('pollChannelSessions syncs channel row model into the local session override', async () => {
@@ -2200,12 +2424,94 @@ test('sessions.changed drives IM loading status without creating a local active 
   ]);
 });
 
+test('sessions.changed start reports an IM prompt once across lifecycle and ActiveTurn paths', () => {
+  const sessionKey = 'agent:main:openclaw-weixin:bot-1:direct:user-1';
+  const { session, store } = createReconcileStore([], {
+    sessionId: 'session-1',
+  });
+  const observedStatuses: string[] = [];
+  const onChannelPromptSubmit = vi.fn(() => {
+    observedStatuses.push(session.status);
+  });
+  const adapter = new OpenClawRuntimeAdapter(store, {}, { onChannelPromptSubmit });
+  adapter.channelSessionSync = {
+    isChannelSessionKey: (key: string) => key === sessionKey,
+    isCurrentBindingKey: () => true,
+    resolveOrCreateSession: () => session.id,
+  };
+  adapter.prefetchChannelUserMessages = vi.fn();
+  adapter.startTurnTimeoutWatchdog = vi.fn();
+
+  const lifecycleStart = {
+    event: 'sessions.changed',
+    payload: {
+      sessionKey,
+      runId: 'im-run-lifecycle',
+      phase: 'start',
+      status: 'running',
+    },
+  };
+  adapter.handleGatewayEvent(lifecycleStart);
+  adapter.handleGatewayEvent(lifecycleStart);
+
+  expect(onChannelPromptSubmit).toHaveBeenCalledOnce();
+  expect(onChannelPromptSubmit).toHaveBeenLastCalledWith({
+    agentId: 'main',
+    conversationState: 'new_task',
+    isMainAgent: true,
+    platform: 'weixin',
+  });
+  expect(observedStatuses).toEqual(['running']);
+  expect(adapter.activeTurns.has(session.id)).toBe(false);
+
+  adapter.ensureActiveTurn(session.id, sessionKey, 'im-run-lifecycle');
+
+  expect(adapter.activeTurns.has(session.id)).toBe(true);
+  expect(onChannelPromptSubmit).toHaveBeenCalledOnce();
+});
+
+test('IM prompt analytics remains once when the ActiveTurn starts before its real run id arrives', () => {
+  const sessionKey = 'agent:main:openclaw-weixin:bot-1:direct:user-1';
+  const { session, store } = createReconcileStore([], {
+    sessionId: 'session-1',
+  });
+  const onChannelPromptSubmit = vi.fn();
+  const adapter = new OpenClawRuntimeAdapter(store, {}, { onChannelPromptSubmit });
+  adapter.channelSessionSync = {
+    isChannelSessionKey: (key: string) => key === sessionKey,
+    isCurrentBindingKey: () => true,
+    resolveOrCreateSession: () => session.id,
+  };
+  adapter.prefetchChannelUserMessages = vi.fn();
+  adapter.startTurnTimeoutWatchdog = vi.fn();
+
+  adapter.ensureActiveTurn(session.id, sessionKey, '');
+  expect(onChannelPromptSubmit).toHaveBeenCalledOnce();
+
+  adapter.handleGatewayEvent({
+    event: 'sessions.changed',
+    payload: {
+      sessionKey,
+      runId: 'im-run-real',
+      phase: 'start',
+      status: 'running',
+    },
+  });
+
+  expect(onChannelPromptSubmit).toHaveBeenCalledOnce();
+  expect(adapter.reportedChannelPromptRunIds.has('im-run-real')).toBe(true);
+  expect(adapter.activeTurns.get(session.id)?.promptAnalyticsReported).toBe(true);
+  expect(adapter.activeTurns.get(session.id)?.knownRunIds.has('im-run-real')).toBe(true);
+  expect(adapter.sessionIdByRunId.get('im-run-real')).toBe(session.id);
+});
+
 test('sessions.changed IM status handling excludes desktop, cron, main, subagent, and stale bindings', () => {
   const validSessionKey = 'agent:main:feishu:dm:ou_123';
   const { session, store, getUpdateSessionCalls } = createReconcileStore([], {
     sessionId: 'session-1',
   });
-  const adapter = new OpenClawRuntimeAdapter(store, {});
+  const onChannelPromptSubmit = vi.fn();
+  const adapter = new OpenClawRuntimeAdapter(store, {}, { onChannelPromptSubmit });
   const resolveOrCreateSession = vi.fn(() => session.id);
   adapter.channelSessionSync = {
     isCurrentBindingKey: (key: string) => key !== validSessionKey,
@@ -2232,7 +2538,144 @@ test('sessions.changed IM status handling excludes desktop, cron, main, subagent
 
   expect(session.status).toBe('completed');
   expect(resolveOrCreateSession).not.toHaveBeenCalled();
+  expect(onChannelPromptSubmit).not.toHaveBeenCalled();
   expect(getUpdateSessionCalls().some((call) => 'status' in call.patch)).toBe(false);
+});
+
+test('IM prompt submit analytics reports each channel run once with routing context', () => {
+  const sessionKey = 'agent:ops:feishu:direct:ou_123';
+  const { session, store } = createReconcileStore([], {
+    sessionId: 'session-1',
+  });
+  const onChannelPromptSubmit = vi.fn();
+  const adapter = new OpenClawRuntimeAdapter(store, {}, { onChannelPromptSubmit });
+  adapter.channelSessionSync = {
+    isCurrentBindingKey: () => true,
+  };
+
+  adapter.reportChannelPromptSubmit(session.id, sessionKey, 'im-run-1');
+  adapter.reportChannelPromptSubmit(session.id, sessionKey, 'im-run-1');
+
+  expect(onChannelPromptSubmit).toHaveBeenCalledTimes(1);
+  expect(onChannelPromptSubmit).toHaveBeenLastCalledWith({
+    agentId: 'ops',
+    conversationState: 'new_task',
+    isMainAgent: false,
+    platform: 'feishu',
+  });
+
+  session.messages.push({
+    id: 'assistant-1',
+    type: 'assistant',
+    content: 'done',
+    timestamp: 2,
+    metadata: {},
+  });
+  adapter.reportChannelPromptSubmit(session.id, sessionKey, 'im-run-2');
+
+  expect(onChannelPromptSubmit).toHaveBeenCalledTimes(2);
+  expect(onChannelPromptSubmit).toHaveBeenLastCalledWith({
+    agentId: 'ops',
+    conversationState: 'continue_session',
+    isMainAgent: false,
+    platform: 'feishu',
+  });
+});
+
+test('IM prompt submit analytics keeps its run deduplication memory bounded', () => {
+  const sessionKey = 'agent:main:feishu:direct:ou_123';
+  const { session, store } = createReconcileStore([], {
+    sessionId: 'session-1',
+  });
+  const onChannelPromptSubmit = vi.fn();
+  const adapter = new OpenClawRuntimeAdapter(store, {}, { onChannelPromptSubmit });
+  adapter.channelSessionSync = {
+    isCurrentBindingKey: () => true,
+  };
+
+  for (let index = 0; index <= 2_000; index += 1) {
+    adapter.reportChannelPromptSubmit(session.id, sessionKey, `im-run-${index}`);
+  }
+
+  expect(onChannelPromptSubmit).toHaveBeenCalledTimes(2_001);
+  expect(adapter.reportedChannelPromptRunIds.size).toBe(2_000);
+  expect(adapter.reportedChannelPromptRunIds.has('im-run-0')).toBe(false);
+  expect(adapter.reportedChannelPromptRunIds.has('im-run-2000')).toBe(true);
+});
+
+test('channel ActiveTurn creation emits IM prompt submit analytics without blocking turn startup', () => {
+  const sessionKey = 'agent:main:telegram:direct:user-1';
+  const { session, store } = createReconcileStore([], {
+    sessionId: 'session-1',
+  });
+  const onChannelPromptSubmit = vi.fn();
+  const adapter = new OpenClawRuntimeAdapter(store, {}, { onChannelPromptSubmit });
+  adapter.channelSessionSync = {
+    isChannelSessionKey: () => true,
+    isCurrentBindingKey: () => true,
+  };
+  adapter.prefetchChannelUserMessages = vi.fn();
+  adapter.startTurnTimeoutWatchdog = vi.fn();
+
+  adapter.ensureActiveTurn(session.id, sessionKey, 'im-run-start');
+
+  expect(adapter.activeTurns.has(session.id)).toBe(true);
+  expect(onChannelPromptSubmit).toHaveBeenCalledOnce();
+  expect(adapter.prefetchChannelUserMessages).toHaveBeenCalledWith(session.id, sessionKey);
+
+  adapter.activeTurns.delete(session.id);
+  adapter.ensureActiveTurn(session.id, sessionKey, 'im-run-start');
+
+  expect(adapter.activeTurns.has(session.id)).toBe(true);
+  expect(onChannelPromptSubmit).toHaveBeenCalledOnce();
+});
+
+test('IM prompt submit analytics excludes stale channel bindings', () => {
+  const sessionKey = 'agent:main:telegram:direct:user-1';
+  const { session, store } = createReconcileStore([], {
+    sessionId: 'session-1',
+  });
+  const onChannelPromptSubmit = vi.fn();
+  const adapter = new OpenClawRuntimeAdapter(store, {}, { onChannelPromptSubmit });
+  adapter.channelSessionSync = {
+    isCurrentBindingKey: () => false,
+  };
+
+  adapter.reportChannelPromptSubmit(session.id, sessionKey, 'im-run-stale');
+
+  expect(onChannelPromptSubmit).not.toHaveBeenCalled();
+
+  adapter.channelSessionSync = {
+    isCurrentBindingKey: () => true,
+  };
+  adapter.heartbeatSessionKeys.add(sessionKey);
+  adapter.reportChannelPromptSubmit(session.id, sessionKey, 'im-run-heartbeat');
+
+  expect(onChannelPromptSubmit).not.toHaveBeenCalled();
+});
+
+test('IM prompt submit analytics failures do not escape into the channel turn', () => {
+  const sessionKey = 'agent:main:telegram:direct:user-1';
+  const { session, store } = createReconcileStore([], {
+    sessionId: 'session-1',
+  });
+  const adapter = new OpenClawRuntimeAdapter(store, {}, {
+    onChannelPromptSubmit: () => {
+      throw new Error('analytics unavailable');
+    },
+  });
+  adapter.channelSessionSync = {
+    isCurrentBindingKey: () => true,
+  };
+  const consoleWarn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+  try {
+    expect(() => {
+      adapter.reportChannelPromptSubmit(session.id, sessionKey, 'im-run-error');
+    }).not.toThrow();
+  } finally {
+    consoleWarn.mockRestore();
+  }
 });
 
 test('explicit IM lifecycle start prevents polling from clearing loading mid-run', async () => {
@@ -4801,6 +5244,99 @@ test('stale chat error after a successful deferred final completes the turn inst
   }
 });
 
+test('model idle timeout chat error still surfaces after a deferred final (text-only payload)', async () => {
+  vi.useFakeTimers();
+  try {
+    const { session, store } = createReconcileStore([
+      { id: 'msg-1', type: 'user', content: 'query bhumi-data', timestamp: 1, metadata: {} },
+    ]);
+    session.status = 'running';
+    const adapter = new OpenClawRuntimeAdapter(store, {});
+    const errorSpy = vi.fn();
+    adapter.on('error', errorSpy);
+    const sessionKey = `agent:main:lobsterai:${session.id}`;
+    const turn = createActiveTurn(session.id, sessionKey, 'run-idle-timeout');
+    adapter.activeTurns.set(session.id, turn);
+    adapter.latestTurnTokenBySession.set(session.id, turn.turnToken);
+
+    adapter.handleChatEvent({
+      state: 'final',
+      runId: 'run-idle-timeout',
+      sessionKey,
+      message: { role: 'assistant', content: '明白，接下来只走 bhumi-data 的只读查询。' },
+    }, 1);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(turn.finalCompletionTimer).toBeDefined();
+
+    // OpenClaw's surface_error failover delivers the timeout through the
+    // webchat reply path (broadcastChatError): text only, no metadata, and the
+    // lifecycle ended with isError=false so terminatedRunIds stays empty.
+    const timeoutText = 'LLM request timed out. | The model did not produce a response before the model idle timeout. Please try again, or increase `models.providers.<id>.timeoutSeconds` for slow local or self-hosted provider.';
+    adapter.handleChatEvent({
+      state: 'error',
+      runId: 'run-idle-timeout',
+      sessionKey,
+      errorMessage: timeoutText,
+      message: { role: 'assistant', content: [{ type: 'text', text: `Error: ${timeoutText}` }] },
+    }, 2);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(errorSpy).toHaveBeenCalled();
+    expect(session.status).toBe('error');
+    expect(adapter.activeTurns.has(session.id)).toBe(false);
+  } finally {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  }
+});
+
+test('chat error with provider runtime failure metadata still surfaces after a deferred final', async () => {
+  vi.useFakeTimers();
+  try {
+    const { session, store } = createReconcileStore([
+      { id: 'msg-1', type: 'user', content: 'query bhumi-data', timestamp: 1, metadata: {} },
+    ]);
+    session.status = 'running';
+    const adapter = new OpenClawRuntimeAdapter(store, {});
+    const errorSpy = vi.fn();
+    adapter.on('error', errorSpy);
+    const sessionKey = `agent:main:lobsterai:${session.id}`;
+    const turn = createActiveTurn(session.id, sessionKey, 'run-failover-meta');
+    adapter.activeTurns.set(session.id, turn);
+    adapter.latestTurnTokenBySession.set(session.id, turn.turnToken);
+
+    adapter.handleChatEvent({
+      state: 'final',
+      runId: 'run-failover-meta',
+      sessionKey,
+      message: { role: 'assistant', content: 'partial reply' },
+    }, 1);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(turn.finalCompletionTimer).toBeDefined();
+
+    // The lifecycle-error forwarding path attaches structured observation
+    // fields (extractSafeChatErrorMetadata) to the late chat error.
+    adapter.handleChatEvent({
+      state: 'error',
+      runId: 'run-failover-meta',
+      sessionKey,
+      errorMessage: 'upstream provider failed',
+      provider: 'openai',
+      model: 'gpt-5.6-sol',
+      failoverReason: 'timeout',
+      providerRuntimeFailureKind: 'timeout',
+    }, 2);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(errorSpy).toHaveBeenCalled();
+    expect(session.status).toBe('error');
+    expect(adapter.activeTurns.has(session.id)).toBe(false);
+  } finally {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  }
+});
+
 test('chat error still surfaces when a deferred final exists but the run reported a lifecycle error', async () => {
   vi.useFakeTimers();
   try {
@@ -4935,6 +5471,134 @@ test('chat final terminal error persists visible system message when no assistan
   expect(session.status).toBe('error');
   expect(errorSpy).toHaveBeenCalledWith(session.id, expect.stringContaining('模型响应超时'));
   expect(persistedError?.content).toContain('模型响应超时');
+});
+
+test('chat final terminal error persists enterprise quota signal and technical details', async () => {
+  const { session, store } = createReconcileStore([
+    { id: 'msg-1', type: 'user', content: 'hello', timestamp: 1, metadata: {} },
+  ]);
+  const adapter = new OpenClawRuntimeAdapter(store, {});
+  const sessionKey = `agent:main:lobsterai:${session.id}`;
+
+  session.status = 'running';
+  adapter.on('error', vi.fn());
+  adapter.activeTurns.set(session.id, createActiveTurn(
+    session.id,
+    sessionKey,
+    'run-enterprise-quota',
+  ));
+
+  adapter.handleChatEvent({
+    state: 'final',
+    runId: 'run-enterprise-quota',
+    sessionKey,
+    stopReason: 'error',
+    errorMessage: 'LLM request failed.',
+    errorCode: 41607,
+    provider: 'lobsterai-server',
+    rawErrorPreview: '41607 enterprise pool exhausted',
+  }, 1);
+  await Promise.resolve();
+
+  const persistedError = session.messages.find((message) => message.type === 'system');
+  expect(session.status).toBe('error');
+  expect(persistedError?.metadata).toEqual(expect.objectContaining({
+    enterpriseErrorCode: 41607,
+    enterpriseQuotaReason: 'enterprise_pool_exhausted',
+    errorDetail: expect.objectContaining({
+      provider: 'lobsterai-server',
+      rawErrorMessage: 'LLM request failed.',
+    }),
+  }));
+});
+
+test('chat final stopReason error applies a captured tool-loop veto override', async () => {
+  const { session, store } = createReconcileStore([
+    { id: 'msg-1', type: 'user', content: 'watch the build', timestamp: 1, metadata: {} },
+  ]);
+  const adapter = new OpenClawRuntimeAdapter(store, {});
+  const sessionKey = `agent:main:lobsterai:${session.id}`;
+  const turn = createActiveTurn(session.id, sessionKey, 'run-loop-error');
+  session.status = 'running';
+  adapter.on('error', vi.fn());
+  adapter.activeTurns.set(session.id, turn);
+  adapter.sessionIdByRunId.set(turn.runId, session.id);
+
+  adapter.handleAgentEvent({
+    runId: turn.runId,
+    sessionKey,
+    stream: 'tool',
+    data: {
+      toolCallId: 'call-1',
+      phase: 'result',
+      name: 'process',
+      result: TOOL_LOOP_POLL_BLOCK_TEXT,
+    },
+  }, 1);
+
+  await adapter.handleChatFinal(session.id, turn, {
+    state: 'final',
+    runId: turn.runId,
+    sessionKey,
+    stopReason: 'error',
+    errorMessage: OPENCLAW_INCOMPLETE_TURN_ERROR_TEXT,
+    message: { role: 'assistant', content: 'partial output' },
+  });
+
+  const persistedError = session.messages.find(message => message.type === 'system');
+  expect(session.status).toBe('error');
+  expect(persistedError?.content).toBe(t('coworkErrorToolLoopBlocked'));
+  expect(persistedError?.metadata?.errorDetail?.rawErrorMessage).toContain(
+    OPENCLAW_INCOMPLETE_TURN_ERROR_TEXT,
+  );
+  expect(persistedError?.metadata?.errorDetail?.rawErrorMessage).toContain(
+    TOOL_LOOP_POLL_BLOCK_TEXT,
+  );
+});
+
+test('empty chat final stopReason error cannot defer into completed status', async () => {
+  vi.useFakeTimers();
+  try {
+    const { session, store } = createReconcileStore([
+      { id: 'msg-1', type: 'user', content: 'watch the build', timestamp: 1, metadata: {} },
+    ]);
+    const adapter = new OpenClawRuntimeAdapter(store, {});
+    const sessionKey = `agent:main:lobsterai:${session.id}`;
+    const turn = createActiveTurn(session.id, sessionKey, 'run-empty-loop-error');
+    session.status = 'running';
+    adapter.on('error', vi.fn());
+    adapter.activeTurns.set(session.id, turn);
+    adapter.sessionIdByRunId.set(turn.runId, session.id);
+
+    adapter.handleAgentEvent({
+      runId: turn.runId,
+      sessionKey,
+      stream: 'tool',
+      data: {
+        toolCallId: 'call-1',
+        phase: 'result',
+        name: 'process',
+        result: TOOL_LOOP_POLL_BLOCK_TEXT,
+      },
+    }, 1);
+
+    await adapter.handleChatFinal(session.id, turn, {
+      state: 'final',
+      runId: turn.runId,
+      sessionKey,
+      stopReason: 'error',
+      errorMessage: OPENCLAW_INCOMPLETE_TURN_ERROR_TEXT,
+      message: { role: 'assistant', content: '' },
+    });
+
+    expect(session.status).toBe('error');
+    expect(adapter.activeTurns.has(session.id)).toBe(false);
+    await vi.advanceTimersByTimeAsync(65_000);
+    expect(session.status).toBe('error');
+  } finally {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  }
 });
 
 test('chat error ignores non-managed OpenClaw session key when local session id is unknown', () => {
@@ -8108,6 +8772,38 @@ test('syncFullChannelHistory: cron run history backfills initial run without los
     { type: 'user', content: '提醒我喝水' },
     { type: 'assistant', content: '喝水时间到' },
   ]);
+});
+
+test('cron run system history tracks equal-length runs by raw session key', async () => {
+  const firstRunKey = 'agent:main:cron:drink-water:run:run-1';
+  const secondRunKey = 'agent:main:cron:drink-water:run:run-2';
+  const historyBySessionKey = new Map<string, unknown[]>([
+    [firstRunKey, [{ role: 'system', content: 'First run reminder' }]],
+    [secondRunKey, [{ role: 'system', content: 'Second run reminder' }]],
+  ]);
+  const { session, store } = createHistoryStore([]);
+  const adapter = new OpenClawRuntimeAdapter(store, {});
+  adapter.gatewayClient = {
+    start: () => {},
+    stop: () => {},
+    request: async (_method: string, params?: unknown) => ({
+      messages: historyBySessionKey.get((params as { sessionKey: string }).sessionKey) ?? [],
+    }),
+  };
+
+  adapter.rememberSessionKey(session.id, firstRunKey);
+  await adapter.syncSessionHistoryFromGateway(session.id, firstRunKey);
+  adapter.rememberSessionKey(session.id, secondRunKey);
+  await adapter.syncSessionHistoryFromGateway(session.id, secondRunKey);
+  await adapter.syncSessionHistoryFromGateway(session.id, secondRunKey);
+
+  expect(getSystemMessages(session).map(message => message.content)).toEqual([
+    'First run reminder',
+    'Second run reminder',
+  ]);
+  expect(adapter.gatewayHistoryCountBySession.has(session.id)).toBe(false);
+  expect(adapter.gatewayHistoryCountByCronSessionKey.has(firstRunKey)).toBe(false);
+  expect(adapter.gatewayHistoryCountByCronSessionKey.get(secondRunKey)).toBe(1);
 });
 
 test('syncFullChannelHistory: cron run history does not replace follow-up messages', async () => {

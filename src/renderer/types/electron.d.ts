@@ -44,10 +44,21 @@ import type {
 import type { CoworkGoal } from '../../shared/cowork/goal';
 import type { CoworkMessageRailIndexItem } from '../../shared/cowork/rail';
 import type {
+  CoworkSearchMessage,
+  CoworkSearchMessageCursor,
+} from '../../shared/cowork/search';
+import type {
   DataMigrationBackupResult,
   DataMigrationLastRestoreResponse,
   DataMigrationRestoreScheduleResult,
 } from '../../shared/dataMigration/constants';
+import type { EnterpriseQuotaRequestType } from '../../shared/enterpriseAccount/constants';
+import type {
+  EnterpriseAccountContext,
+  EnterpriseAccountContextResult,
+  EnterpriseAccountIdentitiesResult,
+  EnterpriseQuotaRequestResult,
+} from '../../shared/enterpriseAccount/types';
 import type {
   HtmlShareAccessMode,
   HtmlShareConfigurableStatus,
@@ -139,6 +150,7 @@ interface CoworkSession {
   id: string;
   title: string;
   claudeSessionId: string | null;
+  scheduledTaskId: string | null;
   status: 'idle' | 'running' | 'completed' | 'error';
   pinned: boolean;
   pinOrder?: number | null;
@@ -173,6 +185,7 @@ interface CoworkMessage {
 interface CoworkSessionSummary {
   id: string;
   title: string;
+  scheduledTaskId: string | null;
   status: 'idle' | 'running' | 'completed' | 'error';
   pinned: boolean;
   pinOrder?: number | null;
@@ -712,6 +725,7 @@ interface IElectronAPI {
       systemPrompt?: string;
       identity?: string;
       model?: string;
+      thinkingLevel?: Agent['thinkingLevel'];
       workingDirectory?: string;
       icon?: string;
       skillIds?: string[];
@@ -727,6 +741,7 @@ interface IElectronAPI {
         systemPrompt?: string;
         identity?: string;
         model?: string;
+        thinkingLevel?: Agent['thinkingLevel'];
         workingDirectory?: string;
         icon?: string;
         skillIds?: string[];
@@ -841,6 +856,8 @@ interface IElectronAPI {
       selectedTextSnippets?: Array<{ id: string; text: string; sourceMessageId?: string; sourceMessageType?: 'assistant' | 'artifact_markdown' | 'artifact_text'; sourceId?: string; sourceType?: 'assistant' | 'artifact_markdown' | 'artifact_text'; sourceTitle?: string; sourcePath?: string; artifactId?: string; createdAt: number; startOffset?: number; endOffset?: number }>;
       browserAnnotations?: CoworkBrowserAnnotationMessageBatch[];
       agentId?: string;
+      modelOverride?: string;
+      thinkingLevel?: string;
       imageAttachments?: Array<{ name: string; mimeType: string; base64Data: string; sizeBytes?: number; localPath?: string; previewMimeType?: string; previewBase64Data?: string }>;
       mediaSelection?: { mode: string; modelId?: string; modelName?: string; imageModelId?: string; videoModelId?: string };
       mediaReferences?: Array<{ token: string; mediaType: string; index: number; fileId: string; fileName: string; mimeType: string; localPath?: string; remoteUrl?: string; dataUrl?: string; role?: string }>;
@@ -955,6 +972,21 @@ interface IElectronAPI {
       success: boolean;
       messages?: CoworkMessage[];
       offset?: number;
+      total?: number;
+      error?: string;
+    }>;
+    getSessionSearchMessages: (options: {
+      sessionId: string;
+      limit?: number;
+      offset?: number;
+      cursor?: CoworkSearchMessageCursor;
+      knownTotal?: number;
+    }) => Promise<{
+      success: boolean;
+      messages?: CoworkSearchMessage[];
+      offset?: number;
+      nextOffset?: number;
+      nextCursor?: CoworkSearchMessageCursor;
       total?: number;
       error?: string;
     }>;
@@ -1172,6 +1204,9 @@ interface IElectronAPI {
       truncated?: boolean;
       error?: string;
     }>;
+    saveFileCopy: (
+      filePath: string,
+    ) => Promise<{ success: boolean; canceled?: boolean; path?: string; error?: string }>;
     generateThumbnail: (
       filePath: string,
     ) => Promise<{ success: boolean; dataUrl?: string; error?: string }>;
@@ -1762,16 +1797,27 @@ interface IElectronAPI {
     login: (loginUrl?: string) => Promise<AuthLoginResult>;
     exchange: (
       code: string,
-    ) => Promise<{ success: boolean; user?: any; quota?: any; error?: string }>;
+    ) => Promise<{
+      success: boolean;
+      user?: import('../store/slices/authSlice').UserProfile;
+      quota?: import('../store/slices/authSlice').UserQuota;
+      enterpriseContext?: EnterpriseAccountContext | null;
+      error?: string;
+    }>;
     getUser: () => Promise<{
       success: boolean;
       status?: AuthSessionStatus;
       hasCredentials?: boolean;
-      cachedUser?: any;
-      user?: any;
-      quota?: any;
+      cachedUser?: import('../store/slices/authSlice').UserProfile | null;
+      user?: import('../store/slices/authSlice').UserProfile;
+      quota?: import('../store/slices/authSlice').UserQuota | null;
+      enterpriseContext?: EnterpriseAccountContext | null;
     }>;
-    getQuota: () => Promise<{ success: boolean; quota?: any }>;
+    getQuota: () => Promise<{
+      success: boolean;
+      quota?: import('../store/slices/authSlice').UserQuota;
+      enterpriseContext?: EnterpriseAccountContext | null;
+    }>;
     logout: () => Promise<{ success: boolean }>;
     refreshToken: () => Promise<{
       success: boolean;
@@ -1790,6 +1836,8 @@ interface IElectronAPI {
         supportsImage?: boolean;
         supportsVideo?: boolean;
         supportsThinking?: boolean;
+        thinkingConfig?: import('../../shared/providers/modelThinking').ModelThinkingConfig;
+        requestCapabilities?: import('../../shared/providers/lobsterAIRequestOptions').LobsterAIRequestCapability[];
         supportsToolCalling?: boolean;
         agenticReady?: boolean;
         contextWindow?: number;
@@ -1811,6 +1859,7 @@ interface IElectronAPI {
         description?: string;
         supportsImage?: boolean;
         supportsThinking?: boolean;
+        thinkingConfig?: import('../../shared/providers/modelThinking').ModelThinkingConfig;
         contextWindow?: number | null;
         costMultiplier?: number;
       }>;
@@ -1832,65 +1881,27 @@ interface IElectronAPI {
   };
   enterprise: {
     getConfig: () => Promise<{
-      ui?: Record<string, 'hide' | 'disable' | 'readonly'>;
-      disableUpdate?: boolean;
-      version: string;
-      name: string;
-    } | null>;
+      success: boolean;
+      config: {
+        ui?: Record<string, 'hide' | 'disable' | 'readonly'>;
+        disableUpdate?: boolean;
+        version: string;
+        name: string;
+      } | null;
+      error?: string;
+    }>;
+  };
+  enterpriseAccount: {
+    getContext: () => Promise<EnterpriseAccountContextResult>;
+    getIdentities: () => Promise<EnterpriseAccountIdentitiesResult>;
+    requestQuotaIncrease: (
+      enterpriseId: number,
+      requestType: EnterpriseQuotaRequestType,
+    ) => Promise<EnterpriseQuotaRequestResult>;
+    onContextInvalidated: (callback: () => void) => () => void;
   };
   networkStatus: {
     send: (status: 'online' | 'offline') => void;
-  };
-  auth: {
-    login: (loginUrl?: string) => Promise<AuthLoginResult>;
-    exchange: (code: string) => Promise<{
-      success: boolean;
-      user?: import('../store/slices/authSlice').UserProfile;
-      quota?: {
-        planName: string;
-        subscriptionStatus: string;
-        creditsLimit: number;
-        creditsUsed: number;
-        creditsRemaining: number;
-      };
-      error?: string;
-    }>;
-    getUser: () => Promise<{
-      success: boolean;
-      status?: AuthSessionStatus;
-      hasCredentials?: boolean;
-      cachedUser?: import('../store/slices/authSlice').UserProfile | null;
-      user?: import('../store/slices/authSlice').UserProfile;
-      quota?: {
-        planName: string;
-        subscriptionStatus: string;
-        creditsLimit: number;
-        creditsUsed: number;
-        creditsRemaining: number;
-      };
-    }>;
-    getQuota: () => Promise<{
-      success: boolean;
-      quota?: {
-        planName: string;
-        subscriptionStatus: string;
-        creditsLimit: number;
-        creditsUsed: number;
-        creditsRemaining: number;
-      };
-    }>;
-    logout: () => Promise<{ success: boolean }>;
-    refreshToken: () => Promise<{
-      success: boolean;
-      accessToken?: string;
-      outcome?: AuthRefreshOutcome;
-    }>;
-    getAccessToken: () => Promise<string | null>;
-    getPendingCallback: () => Promise<string | null>;
-    onCallback: (callback: (data: { code: string }) => void) => () => void;
-    onQuotaChanged: (callback: () => void) => () => void;
-    onSessionChanged: (callback: (event: AuthSessionChangedEvent) => void) => () => void;
-    onLifecycleEvent: (callback: (event: AuthLifecycleEvent) => void) => () => void;
   };
   qwen: Record<string, never>;
   feishu: {

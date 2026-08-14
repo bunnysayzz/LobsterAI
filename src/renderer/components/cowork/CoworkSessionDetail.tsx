@@ -3,6 +3,7 @@ import {
   ArrowDownIcon,
   DocumentArrowDownIcon,
   ExclamationTriangleIcon,
+  PaperClipIcon,
   PhotoIcon,
   QuestionMarkCircleIcon,
 } from '@heroicons/react/24/outline';
@@ -11,6 +12,7 @@ import { createPortal } from 'react-dom';
 import { useDispatch, useSelector } from 'react-redux';
 
 import { stripGoalCommandPrefixForDisplay } from '../../../common/sessionTitle';
+import type { CoworkBrowserAnnotationMessageBatch } from '../../../shared/cowork/browserAnnotations';
 import {
   buildCoworkBtwComposerQuestion,
   buildCoworkBtwContextualQuestion,
@@ -24,6 +26,10 @@ import {
   COWORK_RAIL_TOOLTIP_PREVIEW_MAX_LENGTH,
   type CoworkMessageRailIndexItem,
 } from '../../../shared/cowork/rail';
+import type {
+  CoworkSearchMessageCursor,
+  CoworkSearchMessagePage,
+} from '../../../shared/cowork/search';
 import {
   type CoworkSelectedTextSnippet,
   CoworkSelectedTextSource,
@@ -32,6 +38,12 @@ import {
 } from '../../../shared/cowork/selectedText';
 import { ShareDeploymentCandidateSource } from '../../../shared/shareDeployment/constants';
 import { resolveArtifactAutoPreviewEnabled } from '../../config';
+import { EnterpriseQuotaPrompt } from '../../features/enterpriseAccount/components/EnterpriseQuotaPrompt';
+import {
+  findCurrentEnterpriseQuotaSignal,
+  resolveActiveEnterpriseQuotaSignal,
+} from '../../features/enterpriseAccount/quotaPromptState';
+import { selectEnterpriseAccountContext } from '../../features/enterpriseAccount/selectors';
 import { collectSessionArtifacts, loadDetectedFileArtifact } from '../../services/artifactDetection';
 import {
   dedupeArtifactsForDisplay,
@@ -48,6 +60,7 @@ import { readLocalServiceProjectDirectoryCandidate } from '../../services/localS
 import { RootState } from '../../store';
 import {
   selectCurrentMessagesLength,
+  selectCurrentMessagesWithDetachedTail,
   selectCurrentSession,
   selectIsStreaming,
   selectLastMessageContent,
@@ -58,6 +71,7 @@ import {
   activateArtifactFileListTab,
   activateArtifactPreviewTab,
   activateArtifactSubagentTab,
+  activateArtifactUserAttachmentTab,
   addArtifact,
   type ArtifactPreviewTab,
   ArtifactSpecialTab,
@@ -75,6 +89,7 @@ import {
 import {
   addDraftSelectedTextSnippet,
   clearBtwComposerIfUnchanged,
+  clearBtwEntries,
   closeBtwThread,
   openBtwThread,
   PlanConfirmationState,
@@ -107,6 +122,8 @@ import {
   ArtifactPanel,
   type LocalServiceDeploymentRequest,
   SubagentPanelContent,
+  UserAttachmentPanelContent,
+  type UserAttachmentPreviewPayload,
 } from '../artifacts';
 import { reportArtifactPreviewAction } from '../artifacts/artifactAnalytics';
 import { ArtifactFileShareProvider } from '../artifacts/ArtifactFileShareController';
@@ -117,10 +134,14 @@ import {
 } from '../artifacts/autoPreviewPolicy';
 import ComposeIcon from '../icons/ComposeIcon';
 import FileTypeIcon from '../icons/fileTypes/FileTypeIcon';
+import SidebarSearchIcon from '../icons/SidebarSearchIcon';
 import SidebarToggleIcon from '../icons/SidebarToggleIcon';
 import SubagentIcon from '../icons/SubagentIcon';
 import MarkdownContent from '../MarkdownContent';
+import { type ToastEventDetail } from '../Toast';
+import { resolveAgentModelSelection, useAgentSelectedModel } from './agentModelSelection';
 import AssistantTurnBlock, { ContextCompactionDivider } from './AssistantTurnBlock';
+import type { BrowserAnnotationAttachmentOpenPayload } from './BrowserAnnotationMessageAttachments';
 import { type CoworkOpenShareOptionsEventDetail, CoworkUiEvent } from './constants';
 import ContextUsageIndicator from './ContextUsageIndicator';
 import {
@@ -131,10 +152,26 @@ import {
 } from './conversationAnalytics';
 import {
   canScrollElementInWheelDirection,
+  isAtConversationSessionBottom,
   isWheelScrollingAwayFromBottom,
   shouldAutoScrollForPosition,
+  shouldLoadNewerConversationMessages,
 } from './conversationScrollPolicy';
+import {
+  applyConversationSearchHighlights,
+  clearConversationSearchHighlights,
+} from './conversationSearchHighlight';
+import {
+  logConversationSearchDebug,
+  logConversationSearchWarning,
+} from './conversationSearchLogger';
+import {
+  getConversationSearchCenterDelta,
+  isUsableConversationSearchRect,
+  scheduleConversationSearchSettle,
+} from './conversationSearchNavigation';
 import CoworkBtwFloatingPanel from './CoworkBtwFloatingPanel';
+import CoworkConversationSearch from './CoworkConversationSearch';
 import CoworkPromptInput, { type CoworkPromptInputRef } from './CoworkPromptInput';
 import LazyRenderTurn, { clearHeightCache } from './LazyRenderTurn';
 import {
@@ -143,9 +180,7 @@ import {
   type ConversationTurn,
   COWORK_DETAIL_CONTENT_CLASS,
   COWORK_DETAIL_GUTTER_CLASS,
-  getStreamingActivityStatusText,
   getTurnMessageIds,
-  hasRenderableAssistantContent,
   MEDIA_TOKEN_DISPLAY_RE,
   type ToolGroupItem,
 } from './messageDisplayUtils';
@@ -160,7 +195,8 @@ import {
   type CoworkTextExportFormat as CoworkTextExportFormatValue,
   mergeCoworkTextExportMessages,
 } from './sessionExport';
-import SubagentTurnLinks from './SubagentTurnLinks';
+import SubagentSpawnCard from './SubagentSpawnCard';
+import { useCoworkConversationSearch } from './useCoworkConversationSearch';
 import UserMessageContent from './UserMessageContent';
 import UserMessageItem from './UserMessageItem';
 interface CoworkSessionDetailProps {
@@ -712,6 +748,34 @@ const showToast = (message: string): void => {
   window.dispatchEvent(new CustomEvent('app:showToast', { detail: message }));
 };
 
+/**
+ * Success toast for a completed export: adds a "Show in Folder" action so the
+ * user can jump straight to the saved file instead of hunting for it.
+ */
+const showExportedFileToast = (message: string, savedPath?: string): void => {
+  if (!savedPath) {
+    showToast(message);
+    return;
+  }
+  const detail: ToastEventDetail = {
+    message,
+    actionLabel: i18nService.t('showInFolder'),
+    onAction: () => {
+      void (async () => {
+        try {
+          const result = await window.electron?.shell?.showItemInFolder?.(savedPath);
+          if (result && result.success === false) {
+            showToast(i18nService.t('showInFolderFailed'));
+          }
+        } catch {
+          showToast(i18nService.t('showInFolderFailed'));
+        }
+      })();
+    },
+  };
+  window.dispatchEvent(new CustomEvent<ToastEventDetail>('app:showToast', { detail }));
+};
+
 const sanitizeExportFileName = (value: string): string => {
   const sanitized = value.replace(INVALID_FILE_NAME_PATTERN, ' ').replace(/\s+/g, ' ').trim();
   return sanitized || 'cowork-session';
@@ -819,13 +883,115 @@ const getSelectedTextActionTop = (
 
 type CaptureRect = { x: number; y: number; width: number; height: number };
 
-const MAX_EXPORT_CANVAS_HEIGHT = 32760;
-const MAX_EXPORT_SEGMENTS = 240;
+// Chromium caps a canvas dimension at 65535px; stay under it with margin.
+const MAX_EXPORT_CANVAS_DIMENSION = 65000;
+// Cap the final canvas area so content + composed canvases stay within a
+// few hundred MB of bitmap memory during export.
+const MAX_EXPORT_CANVAS_AREA = 60_000_000;
+// Below this render scale the exported text becomes unreadable; sessions that
+// still exceed the canvas dimension at this scale are rejected as too long.
+const MIN_EXPORT_SCALE = 0.5;
+// Non-content chrome added by composeExportCanvas, in CSS px. Must match its
+// layout constants: header 80 + footer 80 + 2 dividers + outer padding 28+28.
+const EXPORT_CHROME_CSS_HEIGHT = 218;
+// Horizontal chrome added by composeExportCanvas: outer padding 24+24.
+const EXPORT_CHROME_CSS_WIDTH = 48;
+const MAX_EXPORT_SEGMENTS = 400;
+// Hard cap on how many messages a single exported image may cover; beyond
+// this the content is guaranteed to blow past the canvas limits anyway.
+const MAX_EXPORT_MESSAGE_COUNT = 1500;
+const EXPORT_IMAGE_DECODE_TIMEOUT_MS = 1500;
+
+class ExportImageCancelledError extends Error {
+  constructor() {
+    super('Export image cancelled');
+  }
+}
+
+class ExportImageTooLongError extends Error {
+  constructor() {
+    super('Conversation too long for a single export image');
+  }
+}
+
+type ExportImageProgress = {
+  phase: 'loading' | 'capturing' | 'saving';
+  current?: number;
+  total?: number;
+};
 
 const waitForNextFrame = (): Promise<void> =>
   new Promise((resolve) => {
     window.requestAnimationFrame(() => resolve());
   });
+
+/** Wait until the container's scroll height stops changing (layout settled). */
+const waitForStableLayout = async (
+  container: HTMLElement,
+  requiredStableFrames = 5,
+  maxFrames = 300,
+): Promise<void> => {
+  let lastScrollHeight = container.scrollHeight;
+  let stableFrames = 0;
+  for (let frame = 0; frame < maxFrames && stableFrames < requiredStableFrames; frame += 1) {
+    await waitForNextFrame();
+    const nextScrollHeight = container.scrollHeight;
+    if (nextScrollHeight === lastScrollHeight) {
+      stableFrames += 1;
+    } else {
+      stableFrames = 0;
+      lastScrollHeight = nextScrollHeight;
+    }
+  }
+};
+
+/**
+ * Force every image in the container to start loading and wait for them to
+ * finish decoding, so the measured layout matches what gets captured. Images
+ * that fail or exceed the timeout are skipped (they capture as-is).
+ */
+const prepareAllImagesForExport = async (
+  container: HTMLElement,
+  timeoutMs = 10000,
+): Promise<void> => {
+  const pendingImages = Array.from(container.querySelectorAll('img')).filter((img) => !img.complete);
+  if (pendingImages.length === 0) return;
+  pendingImages.forEach((img) => {
+    if (img.loading === 'lazy') {
+      img.loading = 'eager';
+    }
+  });
+  await Promise.race([
+    Promise.all(pendingImages.map((img) => img.decode().catch(() => undefined))),
+    new Promise<void>((resolve) => {
+      window.setTimeout(resolve, timeoutMs);
+    }),
+  ]);
+};
+
+/**
+ * Wait for images intersecting the container's viewport to finish decoding so
+ * a capture does not stitch in blank placeholders (lazy-loaded attachments).
+ */
+const waitForViewportImagesReady = async (
+  container: HTMLElement,
+  timeoutMs = EXPORT_IMAGE_DECODE_TIMEOUT_MS,
+): Promise<void> => {
+  const containerRect = container.getBoundingClientRect();
+  const pendingImages = Array.from(container.querySelectorAll('img')).filter((img) => {
+    if (img.complete) return false;
+    const rect = img.getBoundingClientRect();
+    return rect.bottom > containerRect.top && rect.top < containerRect.bottom;
+  });
+  if (pendingImages.length === 0) return;
+  await Promise.race([
+    Promise.all(pendingImages.map((img) => img.decode().catch(() => undefined))),
+    new Promise<void>((resolve) => {
+      window.setTimeout(resolve, timeoutMs);
+    }),
+  ]);
+  await waitForNextFrame();
+};
 
 const loadImageFromBase64 = (pngBase64: string): Promise<HTMLImageElement> =>
   new Promise((resolve, reject) => {
@@ -874,13 +1040,15 @@ const composeExportCanvas = async (
   contentCanvas: HTMLCanvasElement,
   title: string,
   createdAt: number,
+  renderScale: number = window.devicePixelRatio || 1,
 ): Promise<HTMLCanvasElement> => {
   const isDark = document.documentElement.classList.contains('dark');
-  const dpr = window.devicePixelRatio || 1;
+  const dpr = renderScale;
   const fontStack = '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif';
 
-  const contentW = contentCanvas.width;   // CSS px
-  const contentH = contentCanvas.height;  // CSS px
+  // The content canvas is rendered at renderScale device px per CSS px.
+  const contentW = contentCanvas.width / dpr;   // CSS px
+  const contentH = contentCanvas.height / dpr;  // CSS px
 
   // ── Layout constants (CSS px) ──
   const outerPadX = 24;          // horizontal breathing room around card
@@ -1011,11 +1179,11 @@ const composeExportCanvas = async (
 
   ctx.fillStyle = brandColor;
   ctx.font = `600 ${brandFontSize}px ${fontStack}`;
-  ctx.fillText('LobsterAI — 全场景个人助理 Agent', textX, footerCenterY - taglineFontSize / 2 - 2);
+  ctx.fillText('LobsterAI — 全场景办公助手 Agent', textX, footerCenterY - taglineFontSize / 2 - 2);
 
   ctx.fillStyle = subtitleColor;
   ctx.font = `400 ${taglineFontSize}px ${fontStack}`;
-  ctx.fillText('7×24 小时帮你干活的全场景个人助理，由网易有道开发', textX, footerCenterY + brandFontSize / 2 + 3);
+  ctx.fillText('国内大厂首个开源桌面级 Agent，网易有道出品', textX, footerCenterY + brandFontSize / 2 + 3);
 
   ctx.restore(); // card clip
 
@@ -1120,49 +1288,6 @@ class ArtifactPanelErrorBoundary extends React.Component<
   }
 }
 
-const MODEL_RESPONSE_WAITING_HINT_DELAY_MS = 30_000;
-
-// Streaming activity bar shown between messages and input
-const StreamingActivityBar: React.FC<{ messages: CoworkMessage[]; isContextMaintenance?: boolean }> = ({
-  messages,
-  isContextMaintenance = false,
-}) => {
-  const [showLongWaitHint, setShowLongWaitHint] = useState(false);
-
-  useEffect(() => {
-    setShowLongWaitHint(false);
-    if (isContextMaintenance) {
-      return undefined;
-    }
-
-    const timeoutId = window.setTimeout(() => {
-      setShowLongWaitHint(true);
-    }, MODEL_RESPONSE_WAITING_HINT_DELAY_MS);
-    return () => window.clearTimeout(timeoutId);
-  }, [messages, isContextMaintenance]);
-
-  const statusText = getStreamingActivityStatusText(
-    messages,
-    isContextMaintenance,
-    showLongWaitHint,
-  );
-
-  return (
-    <div className={`shrink-0 animate-fade-in ${COWORK_DETAIL_GUTTER_CLASS}`}>
-      <div className={COWORK_DETAIL_CONTENT_CLASS}>
-        <div className="streaming-bar" />
-        {statusText && (
-          <div className="py-1">
-            <span className="text-xs text-secondary" aria-live="polite">
-              {statusText}
-            </span>
-          </div>
-        )}
-      </div>
-    </div>
-  );
-};
-
 // ── Path resolution utilities (used by resolveLocalFilePath) ─────────────────
 
 const safeDecodeURIComponent = (value: string): string => {
@@ -1263,6 +1388,7 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
   const isMac = window.electron.platform === 'darwin';
   const isWindows = window.electron.platform === 'win32';
   const currentSession = useSelector(selectCurrentSession);
+  const enterpriseAccountContext = useSelector(selectEnterpriseAccountContext);
   const isStreaming = useSelector(selectIsStreaming);
   const remoteManaged = useSelector(selectRemoteManaged);
   const lastMessageContent = useSelector(selectLastMessageContent);
@@ -1272,6 +1398,15 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
   const activeKitIds = useSelector((state: RootState) => state.kit.activeKitIds);
   const installedKits = useSelector((state: RootState) => state.kit.installedKits);
   const marketplaceKits = useSelector((state: RootState) => state.kit.marketplaceKits);
+  const currentAgentId = useSelector((state: RootState) => state.agent.currentAgentId);
+  const agents = useSelector((state: RootState) => state.agent.agents);
+  const availableModels = useSelector((state: RootState) => state.model.availableModels);
+  const coworkAgentEngine = useSelector((state: RootState) => state.cowork.config.agentEngine);
+  const currentAgent = agents.find(agent => agent.id === currentAgentId);
+  const currentAgentSelectedModel = useAgentSelectedModel(
+    currentAgentId,
+    currentAgent?.model ?? '',
+  );
   const selectedDraftSnippets = useSelector((state: RootState) =>
     currentSession?.id ? state.cowork.draftSelectedTextSnippets[currentSession.id] ?? [] : []
   );
@@ -1299,6 +1434,7 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
   const messageRailIndex = useSelector((state: RootState) =>
     currentSession?.id ? state.cowork.messageRailIndexBySessionId[currentSession.id] ?? [] : []
   );
+  const currentMessagesWithDetachedTail = useSelector(selectCurrentMessagesWithDetachedTail);
   const isContextCompacting = useSelector((state: RootState) =>
     currentSession?.id ? state.cowork.compactingSessionIds.includes(currentSession.id) : false
   );
@@ -1314,6 +1450,7 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
   const [shouldAutoScroll, setShouldAutoScroll] = useState(true);
   const shouldAutoScrollRef = useRef(true);
   const userDetachedFromBottomRef = useRef(false);
+  const [isViewportAtSessionBottom, setIsViewportAtSessionBottom] = useState(true);
   const [isLoadingMoreMessages, setIsLoadingMoreMessages] = useState(false);
   const [showCompactConfirm, setShowCompactConfirm] = useState(false);
   const [selectedTextAction, setSelectedTextAction] = useState<{
@@ -1323,6 +1460,8 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
     top: number;
   } | null>(null);
   const isLoadingMoreMessagesRef = useRef(false);
+  const isLoadingNewerMessagesRef = useRef(false);
+  const newerMessagesLoadRequestRef = useRef(0);
   const prevScrollHeightRef = useRef<number | null>(null);
   const scrollToBottomIntentRef = useRef(false);
   const scrollToBottomSettleTimersRef = useRef<ReturnType<typeof setTimeout>[]>([]);
@@ -1535,7 +1674,19 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
   const railLinesRef = useRef<HTMLDivElement>(null);
   const [isScrollable, setIsScrollable] = useState(false);
   const [forcedRailTurnIndex, setForcedRailTurnIndex] = useState<number | null>(null);
+  const [conversationSearchLoadVersion, setConversationSearchLoadVersion] = useState(0);
   const forcedRailTurnReleaseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const conversationSearchNavigationRequestRef = useRef(0);
+  const conversationSearchPaginationLockRef = useRef<number | null>(null);
+  const conversationSearchLoadingTargetRef = useRef<string | null>(null);
+  const conversationSearchFailedTargetRef = useRef<string | null>(null);
+  const conversationSearchViewportLockedRef = useRef(false);
+  const conversationSearchForcedTurnRef = useRef<number | null>(null);
+  const conversationSearchFallbackElementRef = useRef<HTMLElement | null>(null);
+  const conversationSearchActiveMatchKeyRef = useRef<string | null>(null);
+  const conversationSearchLastNavigatedMatchKeyRef = useRef<string | null>(null);
+  const conversationSearchManualViewportMatchKeyRef = useRef<string | null>(null);
+  const scrollToBottomRequestRef = useRef(0);
   const [hoveredRailIndex, setHoveredRailIndex] = useState<number | null>(null);
   const [isRailHovered, setIsRailHovered] = useState(false);
   const [railTooltip, setRailTooltip] = useState<{
@@ -1544,8 +1695,25 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
     right: number;
   } | null>(null);
 
+  const markConversationSearchViewportAsManual = useCallback(() => {
+    const activeMatchKey = conversationSearchActiveMatchKeyRef.current;
+    if (!conversationSearchViewportLockedRef.current || !activeMatchKey) return;
+    if (conversationSearchManualViewportMatchKeyRef.current === activeMatchKey) return;
+    conversationSearchManualViewportMatchKeyRef.current = activeMatchKey;
+    conversationSearchNavigationRequestRef.current += 1;
+    conversationSearchPaginationLockRef.current = null;
+    const forcedTurnIndex = conversationSearchForcedTurnRef.current;
+    if (forcedTurnIndex !== null) {
+      conversationSearchForcedTurnRef.current = null;
+      setForcedRailTurnIndex(current => (current === forcedTurnIndex ? null : current));
+    }
+  }, []);
+
   // Export states
   const [isExportingImage, setIsExportingImage] = useState(false);
+  const [exportImageProgress, setExportImageProgress] = useState<ExportImageProgress | null>(null);
+  const isExportingImageRef = useRef(false);
+  const exportImageAbortRef = useRef(false);
   const [isExportingText, setIsExportingText] = useState(false);
   const [showExportOptions, setShowExportOptions] = useState(false);
 
@@ -1563,6 +1731,11 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
 
   useEffect(() => {
     userDetachedFromBottomRef.current = false;
+    isLoadingNewerMessagesRef.current = false;
+    newerMessagesLoadRequestRef.current += 1;
+    scrollToBottomRequestRef.current += 1;
+    conversationSearchManualViewportMatchKeyRef.current = null;
+    setIsViewportAtSessionBottom(true);
     updateShouldAutoScroll(true);
   }, [currentSession?.id, updateShouldAutoScroll]);
 
@@ -1935,6 +2108,8 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
   const [isFileListPreviewTabOpen, setIsFileListPreviewTabOpen] = useState(isPanelOpen);
   const [isBrowserPreviewTabOpen, setIsBrowserPreviewTabOpen] = useState(false);
   const [isSubagentPreviewTabOpen, setIsSubagentPreviewTabOpen] = useState(false);
+  const [isUserAttachmentPreviewTabOpen, setIsUserAttachmentPreviewTabOpen] = useState(false);
+  const [userAttachmentPreview, setUserAttachmentPreview] = useState<UserAttachmentPreviewPayload | null>(null);
   const [activeSpecialPreviewTab, setActiveSpecialPreviewTab] = useState<ArtifactSpecialTab>(ArtifactSpecialTab.FileList);
   const [browserPreviewAddress, setBrowserPreviewAddress] = useState('');
   const [browserPreviewUrl, setBrowserPreviewUrl] = useState('');
@@ -1965,6 +2140,9 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
   const fileListPreviewTabOpenBySessionRef = useRef<Record<string, boolean>>({});
   const browserPreviewTabOpenBySessionRef = useRef<Record<string, boolean>>({});
   const subagentPreviewTabOpenBySessionRef = useRef<Record<string, boolean>>({});
+  const userAttachmentPreviewTabOpenBySessionRef = useRef<Record<string, boolean>>({});
+  const userAttachmentPreviewBySessionRef = useRef<Record<string, UserAttachmentPreviewPayload>>({});
+  const userAttachmentFocusRequestKeyRef = useRef(0);
   const activeSpecialPreviewTabBySessionRef = useRef<Record<string, ArtifactSpecialTab>>({});
   const browserPreviewAddressBySessionRef = useRef<Record<string, string>>({});
   const browserPreviewUrlBySessionRef = useRef<Record<string, string>>({});
@@ -2283,6 +2461,8 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
     setIsFileListPreviewTabOpen(sessionId ? fileListPreviewTabOpenBySessionRef.current[sessionId] ?? false : false);
     setIsBrowserPreviewTabOpen(sessionId ? browserPreviewTabOpenBySessionRef.current[sessionId] ?? false : false);
     setIsSubagentPreviewTabOpen(sessionId ? subagentPreviewTabOpenBySessionRef.current[sessionId] ?? false : false);
+    setIsUserAttachmentPreviewTabOpen(sessionId ? userAttachmentPreviewTabOpenBySessionRef.current[sessionId] ?? false : false);
+    setUserAttachmentPreview(sessionId ? userAttachmentPreviewBySessionRef.current[sessionId] ?? null : null);
     setActiveSpecialPreviewTab(sessionId
       ? activeSpecialPreviewTabBySessionRef.current[sessionId] ?? ArtifactSpecialTab.FileList
       : ArtifactSpecialTab.FileList);
@@ -2340,6 +2520,20 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
     setIsSubagentPreviewTabOpen(open);
     if (sessionId) {
       subagentPreviewTabOpenBySessionRef.current[sessionId] = open;
+    }
+  }, [sessionId]);
+
+  const setSessionUserAttachmentPreviewTabOpen = useCallback((open: boolean) => {
+    setIsUserAttachmentPreviewTabOpen(open);
+    if (sessionId) {
+      userAttachmentPreviewTabOpenBySessionRef.current[sessionId] = open;
+    }
+  }, [sessionId]);
+
+  const setSessionUserAttachmentPreview = useCallback((payload: UserAttachmentPreviewPayload) => {
+    setUserAttachmentPreview(payload);
+    if (sessionId) {
+      userAttachmentPreviewBySessionRef.current[sessionId] = payload;
     }
   }, [sessionId]);
 
@@ -2781,6 +2975,12 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
       return;
     }
 
+    if (isUserAttachmentPreviewTabOpen) {
+      setSessionActiveSpecialPreviewTab(ArtifactSpecialTab.UserAttachment);
+      dispatch(activateArtifactUserAttachmentTab({ sessionId }));
+      return;
+    }
+
     dispatch(closePanel({ sessionId }));
   }, [
     activeArtifactPreviewTab,
@@ -2789,6 +2989,7 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
     dispatch,
     isBrowserPreviewTabOpen,
     isSubagentPreviewTabOpen,
+    isUserAttachmentPreviewTabOpen,
     sessionId,
     setSessionActiveSpecialPreviewTab,
     setSessionFileListPreviewTabOpen,
@@ -2871,6 +3072,12 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
       return;
     }
 
+    if (isUserAttachmentPreviewTabOpen) {
+      setSessionActiveSpecialPreviewTab(ArtifactSpecialTab.UserAttachment);
+      dispatch(activateArtifactUserAttachmentTab({ sessionId }));
+      return;
+    }
+
     dispatch(closePanel({ sessionId }));
   }, [
     activeArtifactPreviewTab,
@@ -2880,6 +3087,7 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
     clearBrowserPreviewState,
     isFileListPreviewTabOpen,
     isSubagentPreviewTabOpen,
+    isUserAttachmentPreviewTabOpen,
     sessionId,
     setSessionActiveSpecialPreviewTab,
     setSessionBrowserPreviewTabOpen,
@@ -2923,6 +3131,12 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
       return;
     }
 
+    if (isUserAttachmentPreviewTabOpen) {
+      setSessionActiveSpecialPreviewTab(ArtifactSpecialTab.UserAttachment);
+      dispatch(activateArtifactUserAttachmentTab({ sessionId }));
+      return;
+    }
+
     dispatch(closePanel({ sessionId }));
   }, [
     activeArtifactPreviewTab,
@@ -2931,10 +3145,112 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
     dispatch,
     isBrowserPreviewTabOpen,
     isFileListPreviewTabOpen,
+    isUserAttachmentPreviewTabOpen,
     sessionId,
     setSessionActiveSpecialPreviewTab,
     setSessionSubagentPreviewTabOpen,
   ]);
+
+  const handleActivateArtifactUserAttachmentTab = useCallback(() => {
+    if (!sessionId) return;
+    reportArtifactPreviewAction({
+      actionType: 'panel_tab_switch',
+      source: 'artifact_panel',
+      params: {
+        tabType: 'user_attachment',
+        tabCount: artifactTabsWithArtifacts.length,
+      },
+    });
+    setSessionUserAttachmentPreviewTabOpen(true);
+    setSessionActiveSpecialPreviewTab(ArtifactSpecialTab.UserAttachment);
+    dispatch(activateArtifactUserAttachmentTab({ sessionId }));
+  }, [artifactTabsWithArtifacts.length, dispatch, sessionId, setSessionActiveSpecialPreviewTab, setSessionUserAttachmentPreviewTabOpen]);
+
+  const handleCloseArtifactUserAttachmentTab = useCallback(() => {
+    const wasActive = !activeArtifactPreviewTab && activeSpecialPreviewTab === ArtifactSpecialTab.UserAttachment;
+    reportArtifactPreviewAction({
+      actionType: 'panel_tab_close',
+      source: 'artifact_panel',
+      params: {
+        tabType: 'user_attachment',
+        wasActive,
+        tabCount: artifactTabsWithArtifacts.length,
+      },
+    });
+    setSessionUserAttachmentPreviewTabOpen(false);
+    if (!sessionId) {
+      dispatch(closePanel(undefined));
+      return;
+    }
+
+    if (!wasActive) return;
+
+    const nextTabId = artifactTabsWithArtifacts[0]?.tab.id;
+    if (nextTabId) {
+      dispatch(activateArtifactPreviewTab({ sessionId, tabId: nextTabId }));
+      return;
+    }
+
+    if (isBrowserPreviewTabOpen) {
+      setSessionActiveSpecialPreviewTab(ArtifactSpecialTab.Browser);
+      dispatch(activateArtifactBrowserTab({ sessionId }));
+      return;
+    }
+
+    if (isFileListPreviewTabOpen) {
+      setSessionActiveSpecialPreviewTab(ArtifactSpecialTab.FileList);
+      dispatch(activateArtifactFileListTab({ sessionId }));
+      return;
+    }
+
+    if (isSubagentPreviewTabOpen) {
+      setSessionActiveSpecialPreviewTab(ArtifactSpecialTab.Subagents);
+      dispatch(activateArtifactSubagentTab({ sessionId }));
+      return;
+    }
+
+    dispatch(closePanel({ sessionId }));
+  }, [
+    activeArtifactPreviewTab,
+    activeSpecialPreviewTab,
+    artifactTabsWithArtifacts,
+    dispatch,
+    isBrowserPreviewTabOpen,
+    isFileListPreviewTabOpen,
+    isSubagentPreviewTabOpen,
+    sessionId,
+    setSessionActiveSpecialPreviewTab,
+    setSessionUserAttachmentPreviewTabOpen,
+  ]);
+
+  const handleOpenMessageAnnotation = useCallback((
+    message: CoworkMessage,
+    payload: BrowserAnnotationAttachmentOpenPayload,
+  ) => {
+    if (!sessionId) return;
+    const metadata = message.metadata as CoworkMessageMetadata | undefined;
+    const batches = (metadata?.browserAnnotations ?? []) as CoworkBrowserAnnotationMessageBatch[];
+    if (batches.length === 0) return;
+    userAttachmentFocusRequestKeyRef.current += 1;
+    setSessionUserAttachmentPreview({
+      batches,
+      focusAnnotationId: payload.annotationId,
+      focusRequestKey: userAttachmentFocusRequestKeyRef.current,
+    });
+    setSessionUserAttachmentPreviewTabOpen(true);
+    setSessionActiveSpecialPreviewTab(ArtifactSpecialTab.UserAttachment);
+    dispatch(activateArtifactUserAttachmentTab({ sessionId }));
+  }, [
+    dispatch,
+    sessionId,
+    setSessionActiveSpecialPreviewTab,
+    setSessionUserAttachmentPreview,
+    setSessionUserAttachmentPreviewTabOpen,
+  ]);
+
+  const handleAnnotationSendRequest = useCallback(() => {
+    promptInputRef.current?.submit();
+  }, []);
 
   const handleActivateArtifactTab = useCallback((tabId: string) => {
     if (!sessionId) return;
@@ -3455,6 +3771,43 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
     return mergeCoworkTextExportMessages(storedMessages, loadedMessages);
   }, [currentSession]);
 
+  const loadConversationSearchMessagePage = useCallback(async (
+    options: {
+      offset: number;
+      limit: number;
+      cursor?: CoworkSearchMessageCursor;
+      knownTotal?: number;
+    },
+  ): Promise<CoworkSearchMessagePage> => {
+    const targetSessionId = currentSession?.id;
+    if (!targetSessionId) {
+      throw new Error('Cannot load conversation search history without a session');
+    }
+    const result = await window.electron.cowork.getSessionSearchMessages({
+      sessionId: targetSessionId,
+      offset: options.offset,
+      limit: options.limit,
+      cursor: options.cursor,
+      knownTotal: options.knownTotal,
+    });
+    if (
+      !result.success
+      || !result.messages
+      || result.offset === undefined
+      || result.nextOffset === undefined
+      || result.total === undefined
+    ) {
+      throw new Error(result.error || 'Failed to load conversation search history');
+    }
+    return {
+      messages: result.messages,
+      offset: result.offset,
+      nextOffset: result.nextOffset,
+      nextCursor: result.nextCursor,
+      total: result.total,
+    };
+  }, [currentSession?.id]);
+
   const handleExportText = useCallback(async (format: CoworkTextExportFormatValue) => {
     if (!currentSession || isExportingText) return;
     setIsExportingText(true);
@@ -3486,9 +3839,7 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
             result: 'success',
           },
         });
-        window.dispatchEvent(new CustomEvent('app:showToast', {
-          detail: i18nService.t('coworkExportTextSuccess'),
-        }));
+        showExportedFileToast(i18nService.t('coworkExportTextSuccess'), result.path);
       } else if (result.canceled) {
         reportConversationNavigationAction({
           actionType: 'export_text_result',
@@ -3537,207 +3888,328 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
     });
     if (result.canceled) return;
 
-    window.dispatchEvent(new CustomEvent('app:showToast', {
-      detail: result.success
-        ? i18nService.t('coworkExportDiagnosticsSuccess')
-        : result.error || i18nService.t('coworkExportDiagnosticsFailed'),
-    }));
+    if (result.success) {
+      showExportedFileToast(i18nService.t('coworkExportDiagnosticsSuccess'), result.path);
+    } else {
+      showToast(result.error || i18nService.t('coworkExportDiagnosticsFailed'));
+    }
   }, [currentSession?.id, getConversationControlAnalyticsParams]);
+
+  const handleCancelExportImage = useCallback(() => {
+    exportImageAbortRef.current = true;
+  }, []);
 
   const handleShareClick = (e: React.MouseEvent) => {
     e.stopPropagation();
     if (!currentSession || isExportingImage) return;
+    if (isSessionBusy) {
+      showToast(i18nService.t('coworkExportImageSessionBusy'));
+      return;
+    }
+    const sessionId = currentSession.id;
+    const sessionTitle = currentSession.title;
+    const sessionCreatedAt = currentSession.createdAt;
+    const knownTotalMessages = Math.max(
+      currentSession.totalMessages ?? 0,
+      currentSession.messages.length,
+    );
     setIsExportingImage(true);
+    isExportingImageRef.current = true;
+    exportImageAbortRef.current = false;
+    setExportImageProgress({ phase: 'loading' });
     reportConversationNavigationAction({
       actionType: 'export_image_submit',
       params: getConversationControlAnalyticsParams(),
     });
 
-    window.requestAnimationFrame(() => {
-      void (async () => {
-        try {
-          const scrollContainer = scrollContainerRef.current;
-          if (!scrollContainer) {
-            throw new Error('Capture target not found');
+    void (async () => {
+      try {
+        const scrollContainer = scrollContainerRef.current;
+        if (!scrollContainer) {
+          throw new Error('Capture target not found');
+        }
+        const throwIfAborted = () => {
+          if (exportImageAbortRef.current) {
+            throw new ExportImageCancelledError();
           }
-          const initialScrollTop = scrollContainer.scrollTop;
-          try {
-            const scrollRect = domRectToCaptureRect(scrollContainer.getBoundingClientRect());
-            if (scrollRect.width <= 0 || scrollRect.height <= 0) {
-              throw new Error('Invalid capture area');
-            }
-
-            const scrollContentHeight = Math.max(scrollContainer.scrollHeight, scrollContainer.clientHeight);
-            if (scrollContentHeight <= 0) {
-              throw new Error('Invalid content height');
-            }
-
-            const toContentY = (viewportY: number): number => {
-              const y = scrollContainer.scrollTop + (viewportY - scrollRect.y);
-              return Math.max(0, Math.min(scrollContentHeight, y));
-            };
-
-            const userAnchors = scrollContainer.querySelectorAll<HTMLElement>('[data-export-role="user-message"]');
-            const assistantAnchors = scrollContainer.querySelectorAll<HTMLElement>('[data-export-role="assistant-block"]');
-
-            let contentStart = 0;
-            let contentEnd = scrollContentHeight;
-
-            if (userAnchors.length > 0) {
-              contentStart = toContentY(userAnchors[0].getBoundingClientRect().top);
-            } else if (assistantAnchors.length > 0) {
-              contentStart = toContentY(assistantAnchors[0].getBoundingClientRect().top);
-            }
-
-            if (assistantAnchors.length > 0) {
-              const lastAssistant = assistantAnchors[assistantAnchors.length - 1];
-              contentEnd = toContentY(lastAssistant.getBoundingClientRect().bottom);
-            } else if (userAnchors.length > 0) {
-              const lastUser = userAnchors[userAnchors.length - 1];
-              contentEnd = toContentY(lastUser.getBoundingClientRect().bottom);
-            }
-
-            const maxStart = Math.max(0, scrollContentHeight - 1);
-            contentStart = Math.max(0, Math.min(maxStart, Math.round(contentStart)));
-            contentEnd = Math.max(contentStart + 1, Math.min(scrollContentHeight, Math.round(contentEnd)));
-
-            const outputHeight = contentEnd - contentStart;
-
-            if (outputHeight > MAX_EXPORT_CANVAS_HEIGHT) {
-              throw new Error(`Export image is too tall (${outputHeight}px)`);
-            }
-
-            const segmentsEstimate = Math.ceil(outputHeight / Math.max(1, scrollRect.height)) + 1;
-            if (segmentsEstimate > MAX_EXPORT_SEGMENTS) {
-              throw new Error('Export image is too long');
-            }
-
-            const canvas = document.createElement('canvas');
-            canvas.width = scrollRect.width;
-            canvas.height = outputHeight;
-            const context = canvas.getContext('2d');
-            if (!context) {
-              throw new Error('Canvas context unavailable');
-            }
-
-            const captureAndLoad = async (rect: CaptureRect): Promise<HTMLImageElement> => {
-              const chunk = await coworkService.captureSessionImageChunk({ rect });
-              if (!chunk.success || !chunk.pngBase64) {
-                throw new Error(chunk.error || 'Failed to capture image chunk');
+        };
+        const initialDistanceToBottom =
+          scrollContainer.scrollHeight - scrollContainer.scrollTop - scrollContainer.clientHeight;
+        try {
+          // Phase 1: bring the whole conversation into the DOM. Sessions are
+          // paginated (only a recent window is loaded), so capturing without
+          // this exports just the loaded slice of a long conversation.
+          if (knownTotalMessages > MAX_EXPORT_MESSAGE_COUNT) {
+            throw new ExportImageTooLongError();
+          }
+          let contentTooLong = false;
+          const historyLoaded = await coworkService.loadFullSessionHistory(sessionId, {
+            onProgress: (loadedCount, totalCount) => {
+              setExportImageProgress({ phase: 'loading', current: loadedCount, total: totalCount });
+              if (scrollContainer.scrollHeight > MAX_EXPORT_CANVAS_DIMENSION / MIN_EXPORT_SCALE) {
+                contentTooLong = true;
               }
-              return loadImageFromBase64(chunk.pngBase64);
-            };
+            },
+            shouldAbort: () => exportImageAbortRef.current || contentTooLong,
+          });
+          if (contentTooLong) {
+            throw new ExportImageTooLongError();
+          }
+          throwIfAborted();
+          if (!historyLoaded) {
+            throw new Error('Failed to load the full conversation history');
+          }
 
-            scrollContainer.scrollTop = Math.min(contentStart, Math.max(0, scrollContainer.scrollHeight - scrollContainer.clientHeight));
-            await waitForNextFrame();
-            await waitForNextFrame();
+          await prepareAllImagesForExport(scrollContainer);
+          await waitForStableLayout(scrollContainer);
+          throwIfAborted();
 
+          // Phase 2: measure the settled layout. Clamp the rect to the window:
+          // capturePage cannot see pixels outside the viewport, and passing an
+          // off-screen rect yields clamped chunks that stretch when stitched
+          // (e.g. a narrow window where the min-width chat column overflows).
+          const boundingRect = scrollContainer.getBoundingClientRect();
+          const visibleLeft = Math.max(0, boundingRect.left);
+          const visibleTop = Math.max(0, boundingRect.top);
+          const scrollRect = domRectToCaptureRect(new DOMRect(
+            visibleLeft,
+            visibleTop,
+            Math.min(boundingRect.right, window.innerWidth) - visibleLeft,
+            Math.min(boundingRect.bottom, window.innerHeight) - visibleTop,
+          ));
+          if (scrollRect.width <= 0 || scrollRect.height <= 0) {
+            throw new Error('Invalid capture area');
+          }
+
+          const scrollContentHeight = Math.max(scrollContainer.scrollHeight, scrollContainer.clientHeight);
+          if (scrollContentHeight <= 0) {
+            throw new Error('Invalid content height');
+          }
+
+          const toContentY = (viewportY: number): number => {
+            const y = scrollContainer.scrollTop + (viewportY - scrollRect.y);
+            return Math.max(0, Math.min(scrollContentHeight, y));
+          };
+
+          const userAnchors = scrollContainer.querySelectorAll<HTMLElement>('[data-export-role="user-message"]');
+          const assistantAnchors = scrollContainer.querySelectorAll<HTMLElement>('[data-export-role="assistant-block"]');
+
+          let contentStart = 0;
+          let contentEnd = scrollContentHeight;
+
+          if (userAnchors.length > 0) {
+            contentStart = toContentY(userAnchors[0].getBoundingClientRect().top);
+          } else if (assistantAnchors.length > 0) {
+            contentStart = toContentY(assistantAnchors[0].getBoundingClientRect().top);
+          }
+
+          if (assistantAnchors.length > 0) {
+            const lastAssistant = assistantAnchors[assistantAnchors.length - 1];
+            contentEnd = toContentY(lastAssistant.getBoundingClientRect().bottom);
+          } else if (userAnchors.length > 0) {
+            const lastUser = userAnchors[userAnchors.length - 1];
+            contentEnd = toContentY(lastUser.getBoundingClientRect().bottom);
+          }
+
+          const maxStart = Math.max(0, scrollContentHeight - 1);
+          contentStart = Math.max(0, Math.min(maxStart, Math.round(contentStart)));
+          contentEnd = Math.max(contentStart + 1, Math.min(scrollContentHeight, Math.round(contentEnd)));
+
+          const outputHeight = contentEnd - contentStart;
+
+          // Phase 3: pick an export scale that keeps the composed canvas
+          // inside Chromium's canvas limits. Long conversations degrade to a
+          // lower resolution instead of failing; only extreme ones reject.
+          const devicePixelRatio = window.devicePixelRatio || 1;
+          const composedCssHeight = outputHeight + EXPORT_CHROME_CSS_HEIGHT;
+          const composedCssWidth = scrollRect.width + EXPORT_CHROME_CSS_WIDTH;
+          const dimensionScale = MAX_EXPORT_CANVAS_DIMENSION / composedCssHeight;
+          const areaScale = Math.sqrt(MAX_EXPORT_CANVAS_AREA / (composedCssHeight * composedCssWidth));
+          const exportScale = Math.min(devicePixelRatio, dimensionScale, areaScale);
+          if (exportScale < MIN_EXPORT_SCALE) {
+            throw new ExportImageTooLongError();
+          }
+
+          const totalSegments = Math.ceil(outputHeight / Math.max(1, scrollRect.height));
+          if (totalSegments + 1 > MAX_EXPORT_SEGMENTS) {
+            throw new ExportImageTooLongError();
+          }
+
+          const canvas = document.createElement('canvas');
+          canvas.width = Math.max(1, Math.round(scrollRect.width * exportScale));
+          canvas.height = Math.max(1, Math.round(outputHeight * exportScale));
+          const context = canvas.getContext('2d');
+          if (!context) {
+            throw new Error('Canvas context unavailable');
+          }
+
+          const captureAndLoad = async (rect: CaptureRect): Promise<HTMLImageElement> => {
+            const chunk = await coworkService.captureSessionImageChunk({ rect });
+            if (!chunk.success || !chunk.pngBase64) {
+              throw new Error(chunk.error || 'Failed to capture image chunk');
+            }
+            return loadImageFromBase64(chunk.pngBase64);
+          };
+
+          // Phase 4: scroll through the conversation and stitch the chunks.
+          scrollContainer.scrollTop = Math.min(contentStart, Math.max(0, scrollContainer.scrollHeight - scrollContainer.clientHeight));
+          await waitForNextFrame();
+          await waitForNextFrame();
+
+          let contentOffset = contentStart;
+          let capturedSegments = 0;
+          while (contentOffset < contentEnd) {
+            throwIfAborted();
+            capturedSegments += 1;
+            if (capturedSegments > MAX_EXPORT_SEGMENTS) {
+              throw new Error('Failed to stitch export image');
+            }
+            setExportImageProgress({
+              phase: 'capturing',
+              current: Math.min(capturedSegments, totalSegments),
+              total: totalSegments,
+            });
             const maxScrollTop = Math.max(0, scrollContainer.scrollHeight - scrollContainer.clientHeight);
-            let contentOffset = contentStart;
-            while (contentOffset < contentEnd) {
-              const targetScrollTop = Math.min(contentOffset, maxScrollTop);
-              scrollContainer.scrollTop = targetScrollTop;
-              await waitForNextFrame();
-              await waitForNextFrame();
+            const targetScrollTop = Math.min(contentOffset, maxScrollTop);
+            scrollContainer.scrollTop = targetScrollTop;
+            await waitForNextFrame();
+            await waitForNextFrame();
+            await waitForViewportImagesReady(scrollContainer);
 
-              const chunkImage = await captureAndLoad(scrollRect);
-              const sourceYOffset = Math.max(0, contentOffset - targetScrollTop);
-              const drawableHeight = Math.min(scrollRect.height - sourceYOffset, contentEnd - contentOffset);
-              if (drawableHeight <= 0) {
-                throw new Error('Failed to stitch export image');
-              }
-              const scaleY = chunkImage.naturalHeight / scrollRect.height;
-              const sourceYInImage = Math.max(0, Math.round(sourceYOffset * scaleY));
-              const sourceHeightInImage = Math.max(1, Math.min(
-                chunkImage.naturalHeight - sourceYInImage,
-                Math.round(drawableHeight * scaleY),
-              ));
-
-              context.drawImage(
-                chunkImage,
-                0,
-                sourceYInImage,
-                chunkImage.naturalWidth,
-                sourceHeightInImage,
-                0,
-                contentOffset - contentStart,
-                scrollRect.width,
-                drawableHeight,
-              );
-
-              contentOffset += drawableHeight;
+            const chunkImage = await captureAndLoad(scrollRect);
+            const sourceYOffset = Math.max(0, contentOffset - targetScrollTop);
+            const drawableHeight = Math.min(scrollRect.height - sourceYOffset, contentEnd - contentOffset);
+            if (drawableHeight <= 0) {
+              throw new Error('Failed to stitch export image');
             }
+            const chunkDeviceScale = chunkImage.naturalHeight / scrollRect.height;
+            const sourceY = sourceYOffset * chunkDeviceScale;
+            const sourceHeight = Math.max(1, Math.min(
+              chunkImage.naturalHeight - sourceY,
+              drawableHeight * chunkDeviceScale,
+            ));
+            // Snap destination rows to integers via shared edges so adjacent
+            // chunks neither overlap nor leave hairline gaps.
+            const destTop = Math.round((contentOffset - contentStart) * exportScale);
+            const destBottom = Math.round((contentOffset - contentStart + drawableHeight) * exportScale);
+            const destHeight = Math.max(1, destBottom - destTop);
 
-            // Compose final canvas with branded header and footer
-            const finalCanvas = await composeExportCanvas(
-              canvas,
-              currentSession.title,
-              currentSession.createdAt,
+            context.drawImage(
+              chunkImage,
+              0,
+              sourceY,
+              chunkImage.naturalWidth,
+              sourceHeight,
+              0,
+              destTop,
+              canvas.width,
+              destHeight,
             );
 
-            const pngDataUrl = finalCanvas.toDataURL('image/png');
-            const base64Index = pngDataUrl.indexOf(',');
-            if (base64Index < 0) {
-              throw new Error('Failed to encode export image');
-            }
+            contentOffset += drawableHeight;
+          }
 
-            const timestamp = formatExportTimestamp(new Date());
-            const saveResult = await coworkService.saveSessionResultImage({
-              pngBase64: pngDataUrl.slice(base64Index + 1),
-              defaultFileName: sanitizeExportFileName(`${currentSession.title}-${timestamp}.png`),
-            });
-            if (saveResult.success && !saveResult.canceled) {
-              reportConversationNavigationAction({
-                actionType: 'export_image_result',
-                params: {
-                  ...getConversationControlAnalyticsParams(),
-                  result: 'success',
-                },
-              });
-              window.dispatchEvent(new CustomEvent('app:showToast', {
-                detail: i18nService.t('coworkExportImageSuccess'),
-              }));
-              return;
-            }
-            if (!saveResult.success) {
-              throw new Error(saveResult.error || 'Failed to export image');
-            }
+          throwIfAborted();
+          setExportImageProgress({ phase: 'saving' });
+
+          // Compose final canvas with branded header and footer
+          const finalCanvas = await composeExportCanvas(
+            canvas,
+            sessionTitle,
+            sessionCreatedAt,
+            exportScale,
+          );
+
+          const pngDataUrl = finalCanvas.toDataURL('image/png');
+          const base64Index = pngDataUrl.indexOf(',');
+          if (base64Index < 0 || pngDataUrl.length - base64Index <= 1) {
+            throw new Error('Failed to encode export image');
+          }
+
+          const timestamp = formatExportTimestamp(new Date());
+          const saveResult = await coworkService.saveSessionResultImage({
+            pngBase64: pngDataUrl.slice(base64Index + 1),
+            defaultFileName: sanitizeExportFileName(`${sessionTitle}-${timestamp}.png`),
+          });
+          if (saveResult.success && !saveResult.canceled) {
             reportConversationNavigationAction({
               actionType: 'export_image_result',
               params: {
                 ...getConversationControlAnalyticsParams(),
-                result: 'cancelled',
+                result: 'success',
               },
             });
-          } finally {
-            scrollContainer.scrollTop = initialScrollTop;
+            showExportedFileToast(i18nService.t('coworkExportImageSuccess'), saveResult.path);
+            return;
           }
-        } catch (error) {
+          if (!saveResult.success) {
+            throw new Error(saveResult.error || 'Failed to export image');
+          }
           reportConversationNavigationAction({
             actionType: 'export_image_result',
             params: {
               ...getConversationControlAnalyticsParams(),
-              result: 'failed',
+              result: 'cancelled',
             },
           });
-          console.error('Failed to export session image:', error);
-          window.dispatchEvent(new CustomEvent('app:showToast', {
-            detail: i18nService.t('coworkExportImageFailed'),
-          }));
         } finally {
-          setIsExportingImage(false);
+          const maxScrollTop = Math.max(0, scrollContainer.scrollHeight - scrollContainer.clientHeight);
+          scrollContainer.scrollTop = Math.max(
+            0,
+            Math.min(maxScrollTop, maxScrollTop - initialDistanceToBottom),
+          );
         }
-      })();
-    });
+      } catch (error) {
+        if (error instanceof ExportImageCancelledError) {
+          reportConversationNavigationAction({
+            actionType: 'export_image_result',
+            params: {
+              ...getConversationControlAnalyticsParams(),
+              result: 'cancelled',
+            },
+          });
+          return;
+        }
+        reportConversationNavigationAction({
+          actionType: 'export_image_result',
+          params: {
+            ...getConversationControlAnalyticsParams(),
+            result: 'failed',
+          },
+        });
+        console.error('Failed to export session image:', error);
+        showToast(error instanceof ExportImageTooLongError
+          ? i18nService.t('coworkExportImageTooLong')
+          : i18nService.t('coworkExportImageFailed'));
+      } finally {
+        setIsExportingImage(false);
+        isExportingImageRef.current = false;
+        setExportImageProgress(null);
+      }
+    })();
   };
 
   const handleMessagesScroll = useCallback(() => {
     const container = scrollContainerRef.current;
     if (!container) return;
     const distanceToBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
+    const loadedMessageCount = currentSession?.messages.length ?? 0;
+    const loadedMessageOffset = currentSession?.messagesOffset ?? 0;
+    const totalMessageCount = currentSession?.totalMessages ?? loadedMessageCount;
+    const hasLoadedSessionEnd = loadedMessageOffset + loadedMessageCount >= totalMessageCount;
+    const nextIsViewportAtSessionBottom = isAtConversationSessionBottom(
+      loadedMessageOffset,
+      loadedMessageCount,
+      totalMessageCount,
+      distanceToBottom,
+    );
+    setIsViewportAtSessionBottom(current => (
+      current === nextIsViewportAtSessionBottom ? current : nextIsViewportAtSessionBottom
+    ));
     const nextShouldAutoScroll = shouldAutoScrollForPosition(
       distanceToBottom,
       userDetachedFromBottomRef.current,
+      conversationSearchViewportLockedRef.current || !hasLoadedSessionEnd,
     );
     if (userDetachedFromBottomRef.current && nextShouldAutoScroll) {
       userDetachedFromBottomRef.current = false;
@@ -3746,18 +4218,47 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
       );
     }
     updateShouldAutoScroll(nextShouldAutoScroll);
-    if (scrollToBottomIntentRef.current && distanceToBottom <= SCROLL_TO_BOTTOM_SETTLE_THRESHOLD) {
-      scrollToBottomIntentRef.current = false;
-      clearScrollToBottomSettleTimers();
-    }
-
     // Check if content overflows the container (use functional updater to avoid redundant re-renders)
     const scrollable = container.scrollHeight > container.clientHeight;
     setIsScrollable((prev) => (prev === scrollable ? prev : scrollable));
     if (!scrollable) return;
 
+    const isSearchNavigationActive = conversationSearchPaginationLockRef.current !== null;
+    let requestedNewerMessages = false;
+    if (!isSearchNavigationActive && shouldLoadNewerConversationMessages(
+      loadedMessageOffset,
+      loadedMessageCount,
+      totalMessageCount,
+      distanceToBottom,
+      isLoadingNewerMessagesRef.current || isLoadingMoreMessagesRef.current,
+    )) {
+      const sessionId = currentSession?.id;
+      if (sessionId) {
+        requestedNewerMessages = true;
+        isLoadingNewerMessagesRef.current = true;
+        const loadRequestId = ++newerMessagesLoadRequestRef.current;
+        logDetailDiagnostic(
+          `loading newer messages after scrolling near the bottom for session ${sessionId}; `
+          + `current offset is ${loadedMessageOffset}; loaded=${loadedMessageCount}; total=${totalMessageCount}.`,
+        );
+        void coworkService.loadNewerMessages(sessionId).catch((error: unknown) => {
+          console.warn(`[CoworkSessionDetail] failed to load newer messages for session ${sessionId}.`, error);
+        }).finally(() => {
+          if (loadRequestId === newerMessagesLoadRequestRef.current) {
+            isLoadingNewerMessagesRef.current = false;
+          }
+        });
+      }
+    }
+
     // Load older messages when scrolled near the top
-    if (container.scrollTop <= 80 && !isLoadingMoreMessagesRef.current) {
+    if (
+      !isSearchNavigationActive
+      && !requestedNewerMessages
+      && !isLoadingNewerMessagesRef.current
+      && container.scrollTop <= 80
+      && !isLoadingMoreMessagesRef.current
+    ) {
       const sessionId = currentSession?.id;
       const offset = currentSession?.messagesOffset ?? 0;
       if (sessionId && offset > 0) {
@@ -3773,7 +4274,6 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
       }
     }
 
-
     // Skip index recalculation during programmatic navigation
     if (isNavigatingRef.current) return;
 
@@ -3781,11 +4281,6 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
     const turnEls = turnElsCacheRef.current;
     const railCount = railItemCountRef.current;
     if (turnEls.length === 0 || railCount === 0) return;
-
-    const loadedMessageCount = currentSession?.messages.length ?? 0;
-    const loadedMessageOffset = currentSession?.messagesOffset ?? 0;
-    const totalMessageCount = currentSession?.totalMessages ?? loadedMessageCount;
-    const hasLoadedSessionEnd = loadedMessageOffset + loadedMessageCount >= totalMessageCount;
 
     // Only snap to the final rail item when the loaded window includes the real
     // session end. Middle windows can also reach their local bottom, and snapping
@@ -3834,7 +4329,6 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
       setCurrentRailIndex(railIdx);
     }
   }, [
-    clearScrollToBottomSettleTimers,
     currentSession?.id,
     currentSession?.messages.length,
     currentSession?.messagesOffset,
@@ -3843,19 +4337,26 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
   ]);
 
   const handleMessagesWheel = useCallback((event: React.WheelEvent<HTMLDivElement>) => {
+    if (event.deltaY === 0) return;
+    if (isWheelHandledByNestedScroller(event.target, event.currentTarget, event.deltaY)) return;
+    markConversationSearchViewportAsManual();
     if (!isWheelScrollingAwayFromBottom(event.deltaY)) return;
     if (userDetachedFromBottomRef.current && !scrollToBottomIntentRef.current) return;
-    if (isWheelHandledByNestedScroller(event.target, event.currentTarget, event.deltaY)) return;
     detachAutoScrollForUserIntent(AutoScrollDetachSource.ConversationWheel);
-  }, [detachAutoScrollForUserIntent]);
+  }, [detachAutoScrollForUserIntent, markConversationSearchViewportAsManual]);
 
   const handleScrollToBottom = useCallback(() => {
     const container = scrollContainerRef.current;
     if (!container) return;
+    const targetSessionId = currentSession?.id;
+    const loadedMessageCount = currentSession?.messages.length ?? 0;
+    const loadedMessageOffset = currentSession?.messagesOffset ?? 0;
+    const totalMessageCount = currentSession?.totalMessages ?? loadedMessageCount;
+    const hasLoadedSessionEnd = loadedMessageOffset + loadedMessageCount >= totalMessageCount;
     const distanceToBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
     const prefersReducedMotion = typeof window.matchMedia === 'function'
       && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-    const scrollLogMessage = `Scroll to bottom requested for session ${currentSession?.id ?? 'unknown'}; distance was ${Math.max(0, Math.round(distanceToBottom))}px.`;
+    const scrollLogMessage = `Scroll to bottom requested for session ${targetSessionId ?? 'unknown'}; distance was ${Math.max(0, Math.round(distanceToBottom))}px; loadedEnd=${hasLoadedSessionEnd}.`;
     console.debug(`[CoworkSessionDetail] ${scrollLogMessage}`);
     window.electron?.log?.fromRenderer?.('debug', 'CoworkSessionDetail', scrollLogMessage);
     reportConversationNavigationAction({
@@ -3869,45 +4370,111 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
         isStreaming,
       },
     });
-    clearScrollToBottomSettleTimers();
-    userDetachedFromBottomRef.current = false;
-    scrollToBottomIntentRef.current = true;
-    if (prefersReducedMotion) {
-      updateShouldAutoScroll(true);
+    const activeSearchMatchKey = conversationSearchActiveMatchKeyRef.current;
+    if (conversationSearchViewportLockedRef.current && activeSearchMatchKey) {
+      markConversationSearchViewportAsManual();
+      clearConversationSearchHighlights();
     }
-    container.scrollTo({
-      top: container.scrollHeight,
-      behavior: prefersReducedMotion ? 'auto' : 'smooth',
+    const requestId = ++scrollToBottomRequestRef.current;
+    const scrollLoadedWindowToBottom = () => {
+      if (requestId !== scrollToBottomRequestRef.current) return;
+      const latestContainer = scrollContainerRef.current;
+      if (!latestContainer) return;
+
+      clearScrollToBottomSettleTimers();
+      userDetachedFromBottomRef.current = false;
+      scrollToBottomIntentRef.current = true;
+      if (prefersReducedMotion) {
+        updateShouldAutoScroll(!conversationSearchViewportLockedRef.current);
+      }
+      latestContainer.scrollTo({
+        top: latestContainer.scrollHeight,
+        behavior: prefersReducedMotion ? 'auto' : 'smooth',
+      });
+      const lastRail = railItemCountRef.current > 0 ? railItemCountRef.current - 1 : -1;
+      currentRailIndexRef.current = lastRail;
+      setCurrentRailIndex(lastRail);
+      SCROLL_TO_BOTTOM_SETTLE_DELAYS_MS.forEach((delayMs, index) => {
+        const timer = setTimeout(() => {
+          if (!scrollToBottomIntentRef.current || requestId !== scrollToBottomRequestRef.current) return;
+          const settledContainer = scrollContainerRef.current;
+          if (!settledContainer) return;
+          const latestDistance = settledContainer.scrollHeight
+            - settledContainer.scrollTop
+            - settledContainer.clientHeight;
+          const isFinalSettleCheck = index === SCROLL_TO_BOTTOM_SETTLE_DELAYS_MS.length - 1;
+          if (latestDistance <= SCROLL_TO_BOTTOM_SETTLE_THRESHOLD && isFinalSettleCheck) {
+            scrollToBottomIntentRef.current = false;
+            clearScrollToBottomSettleTimers();
+            setIsViewportAtSessionBottom(true);
+            updateShouldAutoScroll(!conversationSearchViewportLockedRef.current);
+            return;
+          }
+          if (latestDistance <= SCROLL_TO_BOTTOM_SETTLE_THRESHOLD) return;
+          settledContainer.scrollTo({
+            top: settledContainer.scrollHeight,
+            behavior: prefersReducedMotion || isFinalSettleCheck
+              ? 'auto'
+              : 'smooth',
+          });
+          if (isFinalSettleCheck) {
+            window.requestAnimationFrame(() => {
+              if (requestId !== scrollToBottomRequestRef.current) return;
+              scrollToBottomIntentRef.current = false;
+              clearScrollToBottomSettleTimers();
+              setIsViewportAtSessionBottom(true);
+              updateShouldAutoScroll(!conversationSearchViewportLockedRef.current);
+            });
+          }
+        }, delayMs);
+        scrollToBottomSettleTimersRef.current.push(timer);
+      });
+    };
+
+    if (!targetSessionId || totalMessageCount <= 0 || hasLoadedSessionEnd) {
+      scrollLoadedWindowToBottom();
+      return;
+    }
+
+    clearScrollToBottomSettleTimers();
+    scrollToBottomIntentRef.current = false;
+    updateShouldAutoScroll(false);
+    logRailNavigationDiagnostic(
+      `loading final message window before scrolling to session bottom; offset=${loadedMessageOffset}; loaded=${loadedMessageCount}; total=${totalMessageCount}.`,
+    );
+    void coworkService.loadMessageWindowAroundIndex(
+      targetSessionId,
+      totalMessageCount - 1,
+    ).then((loaded) => {
+      if (requestId !== scrollToBottomRequestRef.current) return;
+      if (!loaded) {
+        console.warn(`[CoworkSessionDetail] failed to load the final message window for session ${targetSessionId}.`);
+        return;
+      }
+      window.requestAnimationFrame(() => {
+        window.requestAnimationFrame(scrollLoadedWindowToBottom);
+      });
+    }).catch((error: unknown) => {
+      if (requestId !== scrollToBottomRequestRef.current) return;
+      console.error(`[CoworkSessionDetail] failed to scroll session ${targetSessionId} to the real bottom.`, error);
     });
-    const lastRail = railItemCountRef.current > 0 ? railItemCountRef.current - 1 : -1;
-    currentRailIndexRef.current = lastRail;
-    setCurrentRailIndex(lastRail);
-    SCROLL_TO_BOTTOM_SETTLE_DELAYS_MS.forEach((delayMs, index) => {
-      const timer = setTimeout(() => {
-        if (!scrollToBottomIntentRef.current) return;
-        const latestContainer = scrollContainerRef.current;
-        if (!latestContainer) return;
-        const latestDistance = latestContainer.scrollHeight - latestContainer.scrollTop - latestContainer.clientHeight;
-        if (latestDistance <= SCROLL_TO_BOTTOM_SETTLE_THRESHOLD) {
-          scrollToBottomIntentRef.current = false;
-          clearScrollToBottomSettleTimers();
-          updateShouldAutoScroll(true);
-          return;
-        }
-        latestContainer.scrollTo({
-          top: latestContainer.scrollHeight,
-          behavior: prefersReducedMotion || index === SCROLL_TO_BOTTOM_SETTLE_DELAYS_MS.length - 1
-            ? 'auto'
-            : 'smooth',
-        });
-      }, delayMs);
-      scrollToBottomSettleTimersRef.current.push(timer);
-    });
-  }, [clearScrollToBottomSettleTimers, currentSession?.id, currentSession?.messages.length, currentSession?.totalMessages, isStreaming, updateShouldAutoScroll]);
+  }, [
+    clearScrollToBottomSettleTimers,
+    currentSession?.id,
+    currentSession?.messages.length,
+    currentSession?.messagesOffset,
+    currentSession?.totalMessages,
+    isStreaming,
+    markConversationSearchViewportAsManual,
+    updateShouldAutoScroll,
+  ]);
 
   const handleScrollToBottomWheel = useCallback((event: React.WheelEvent<HTMLButtonElement>) => {
     const container = scrollContainerRef.current;
     if (!container) return;
+    if (event.deltaY !== 0) {
+      markConversationSearchViewportAsManual();
+    }
     if (isWheelScrollingAwayFromBottom(event.deltaY)) {
       detachAutoScrollForUserIntent(AutoScrollDetachSource.ScrollToBottomControlWheel);
     }
@@ -3922,7 +4489,7 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
       top: event.deltaY * deltaMultiplier,
       behavior: 'auto',
     });
-  }, [detachAutoScrollForUserIntent]);
+  }, [detachAutoScrollForUserIntent, markConversationSearchViewportAsManual]);
 
   const handleRailWheel = useCallback((event: React.WheelEvent<HTMLDivElement>) => {
     const container = railLinesRef.current;
@@ -3946,14 +4513,17 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
     container.scrollTop = nextScrollTop;
   }, []);
 
-  // Auto-load older messages if content doesn't fill the container (no scrollbar = onScroll never fires)
+  // Extend the active window if its content does not fill the viewport, because
+  // no scroll event can reach either pagination edge in that state.
   useEffect(() => {
     const container = scrollContainerRef.current;
-    if (!container || isLoadingMoreMessagesRef.current) return;
+    if (!container) return;
     const sessionId = currentSession?.id;
     const offset = currentSession?.messagesOffset ?? 0;
-    if (!sessionId || offset <= 0) return;
-    if (container.scrollHeight <= container.clientHeight) {
+    const loadedCount = currentSession?.messages.length ?? 0;
+    const totalMessages = currentSession?.totalMessages ?? loadedCount;
+    if (!sessionId || container.scrollHeight > container.clientHeight) return;
+    if (offset > 0 && !isLoadingMoreMessagesRef.current) {
       isLoadingMoreMessagesRef.current = true;
       setIsLoadingMoreMessages(true);
       prevScrollHeightRef.current = container.scrollHeight;
@@ -3965,8 +4535,29 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
         isLoadingMoreMessagesRef.current = false;
         setIsLoadingMoreMessages(false);
       });
+      return;
     }
-  }, [currentSession?.id, currentSession?.messagesOffset, currentSession?.messages.length]);
+    if (offset + loadedCount < totalMessages && !isLoadingNewerMessagesRef.current) {
+      isLoadingNewerMessagesRef.current = true;
+      const loadRequestId = ++newerMessagesLoadRequestRef.current;
+      logDetailDiagnostic(
+        `auto-loading newer messages because session ${sessionId} content height ${container.scrollHeight} `
+        + `does not exceed viewport height ${container.clientHeight}; current offset is ${offset}.`,
+      );
+      void coworkService.loadNewerMessages(sessionId).catch((error: unknown) => {
+        console.warn(`[CoworkSessionDetail] failed to auto-load newer messages for session ${sessionId}.`, error);
+      }).finally(() => {
+        if (loadRequestId === newerMessagesLoadRequestRef.current) {
+          isLoadingNewerMessagesRef.current = false;
+        }
+      });
+    }
+  }, [
+    currentSession?.id,
+    currentSession?.messages.length,
+    currentSession?.messagesOffset,
+    currentSession?.totalMessages,
+  ]);
 
   // Restore scroll position synchronously before browser paint when messages are prepended
   useLayoutEffect(() => {
@@ -4256,6 +4847,79 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
   const messages = currentSession?.messages;
   const displayItems = useMemo(() => messages ? buildDisplayItems(messages) : [], [messages]);
   const turns = useMemo(() => buildConversationTurns(displayItems), [displayItems]);
+  const enterpriseQuotaSignal = useMemo(
+    () => findCurrentEnterpriseQuotaSignal(currentSession, currentMessagesWithDetachedTail),
+    [currentMessagesWithDetachedTail, currentSession],
+  );
+  const sessionModelSelection = useMemo(() => resolveAgentModelSelection({
+    sessionModel: currentSession?.modelOverride,
+    agentModel: currentAgent?.model ?? '',
+    availableModels,
+    fallbackModel: currentAgentSelectedModel,
+    engine: coworkAgentEngine,
+  }), [
+    availableModels,
+    coworkAgentEngine,
+    currentAgent?.model,
+    currentAgentSelectedModel,
+    currentSession?.modelOverride,
+  ]);
+  const activeEnterpriseQuotaSignal = useMemo(
+    () => resolveActiveEnterpriseQuotaSignal(
+      enterpriseQuotaSignal,
+      enterpriseAccountContext,
+      sessionModelSelection.hasInvalidExplicitModel
+        ? null
+        : sessionModelSelection.selectedModel,
+    ),
+    [
+      enterpriseAccountContext,
+      enterpriseQuotaSignal,
+      sessionModelSelection.hasInvalidExplicitModel,
+      sessionModelSelection.selectedModel,
+    ],
+  );
+  const enterpriseQuotaPromptMessageId = enterpriseAccountContext
+    ? enterpriseQuotaSignal?.messageId ?? null
+    : null;
+  const {
+    isOpen: isConversationSearchOpen,
+    query: conversationSearchQuery,
+    status: conversationSearchStatus,
+    errorReason: conversationSearchErrorReason,
+    matches: conversationSearchMatches,
+    isResultLimitReached: isConversationSearchResultLimitReached,
+    activeMatch: activeConversationSearchMatch,
+    activeMatchIndex: activeConversationSearchMatchIndex,
+    focusRequestKey: conversationSearchFocusRequestKey,
+    open: openConversationSearch,
+    close: closeConversationSearch,
+    setQuery: setConversationSearchQuery,
+    navigate: navigateConversationSearch,
+  } = useCoworkConversationSearch({
+    sessionId,
+    currentMessages: currentMessagesWithDetachedTail,
+    currentTotalMessages: currentSession?.totalMessages,
+    loadMessagePage: loadConversationSearchMessagePage,
+  });
+  conversationSearchViewportLockedRef.current = isConversationSearchOpen;
+  const activeConversationSearchMatchKey = activeConversationSearchMatch?.key ?? null;
+  const activeConversationSearchMessageId = activeConversationSearchMatch?.messageId ?? null;
+  const activeConversationSearchAbsoluteIndex = activeConversationSearchMatch?.absoluteMessageIndex ?? -1;
+  const activeConversationSearchSessionId = currentSession?.id;
+  conversationSearchActiveMatchKeyRef.current = activeConversationSearchMatchKey;
+  const isActiveConversationSearchMessageLoaded = useMemo(() => (
+    activeConversationSearchMessageId !== null
+      && Boolean(currentSession?.messages.some(
+        message => message.id === activeConversationSearchMessageId,
+      ))
+  ), [activeConversationSearchMessageId, currentSession?.messages]);
+  const activeConversationSearchTurnIndex = useMemo(() => {
+    if (!activeConversationSearchMessageId) return -1;
+    return turns.findIndex(turn => (
+      getTurnMessageIds(turn).has(activeConversationSearchMessageId)
+    ));
+  }, [activeConversationSearchMessageId, turns]);
   const latestAssistantTurn = useMemo(() => findLatestAssistantTurn(turns), [turns]);
   const loadedRailTurnMap = useMemo(() => buildLoadedRailTurnMap(turns), [turns]);
   const messageOffsetById = useMemo(() => {
@@ -4293,6 +4957,402 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
       ? i18nService.t('coworkRailUnloadedMessageHint')
       : railTooltipItem.summary
     : '';
+
+  const clearConversationSearchPresentation = useCallback(() => {
+    conversationSearchNavigationRequestRef.current += 1;
+    conversationSearchPaginationLockRef.current = null;
+    clearConversationSearchHighlights();
+    conversationSearchFallbackElementRef.current?.classList.remove(
+      'cowork-conversation-search-fallback',
+    );
+    conversationSearchFallbackElementRef.current = null;
+    conversationSearchLoadingTargetRef.current = null;
+    conversationSearchFailedTargetRef.current = null;
+    conversationSearchLastNavigatedMatchKeyRef.current = null;
+    conversationSearchManualViewportMatchKeyRef.current = null;
+    const forcedTurnIndex = conversationSearchForcedTurnRef.current;
+    if (forcedTurnIndex !== null) {
+      setForcedRailTurnIndex(current => current === forcedTurnIndex ? null : current);
+      conversationSearchForcedTurnRef.current = null;
+    }
+  }, []);
+
+  const handleOpenConversationSearch = useCallback(() => {
+    if (!sessionId) return;
+    if (!isConversationSearchOpen) {
+      if (forcedRailTurnReleaseTimerRef.current) {
+        clearTimeout(forcedRailTurnReleaseTimerRef.current);
+        forcedRailTurnReleaseTimerRef.current = null;
+      }
+      setForcedRailTurnIndex(null);
+      conversationSearchForcedTurnRef.current = null;
+    }
+    userDetachedFromBottomRef.current = true;
+    scrollToBottomIntentRef.current = false;
+    clearScrollToBottomSettleTimers();
+    updateShouldAutoScroll(false);
+    setIsArtifactPanelExpanded(false);
+    setIsExpandedPromptInputHidden(false);
+    setIsExpandedConversationPreviewOpen(false);
+    setShowArtifactAddMenu(false);
+    openConversationSearch();
+  }, [
+    clearScrollToBottomSettleTimers,
+    isConversationSearchOpen,
+    openConversationSearch,
+    sessionId,
+    updateShouldAutoScroll,
+  ]);
+
+  useEffect(() => {
+    window.addEventListener(
+      CoworkUiEvent.ShortcutConversationSearch,
+      handleOpenConversationSearch,
+    );
+    return () => {
+      window.removeEventListener(
+        CoworkUiEvent.ShortcutConversationSearch,
+        handleOpenConversationSearch,
+      );
+    };
+  }, [handleOpenConversationSearch]);
+
+  useEffect(() => {
+    if (isConversationSearchOpen) return undefined;
+    clearConversationSearchPresentation();
+    const frameId = window.requestAnimationFrame(handleMessagesScroll);
+    return () => window.cancelAnimationFrame(frameId);
+  }, [
+    clearConversationSearchPresentation,
+    handleMessagesScroll,
+    isConversationSearchOpen,
+  ]);
+
+  useEffect(() => () => {
+    conversationSearchNavigationRequestRef.current += 1;
+    conversationSearchPaginationLockRef.current = null;
+    conversationSearchLoadingTargetRef.current = null;
+    conversationSearchFailedTargetRef.current = null;
+    conversationSearchActiveMatchKeyRef.current = null;
+    conversationSearchLastNavigatedMatchKeyRef.current = null;
+    conversationSearchManualViewportMatchKeyRef.current = null;
+    clearConversationSearchHighlights();
+    conversationSearchFallbackElementRef.current?.classList.remove(
+      'cowork-conversation-search-fallback',
+    );
+  }, []);
+
+  useEffect(() => {
+    const requestId = ++conversationSearchNavigationRequestRef.current;
+    let frameId: number | null = null;
+    let secondFrameId: number | null = null;
+    let cancelSettleChecks: (() => void) | null = null;
+
+    const releasePaginationLock = () => {
+      if (conversationSearchPaginationLockRef.current === requestId) {
+        conversationSearchPaginationLockRef.current = null;
+      }
+    };
+
+    conversationSearchFallbackElementRef.current?.classList.remove(
+      'cowork-conversation-search-fallback',
+    );
+    conversationSearchFallbackElementRef.current = null;
+
+    if (
+      !isConversationSearchOpen
+      || !conversationSearchQuery.trim()
+      || !activeConversationSearchMatchKey
+      || !activeConversationSearchMessageId
+      || !activeConversationSearchSessionId
+    ) {
+      conversationSearchPaginationLockRef.current = null;
+      clearConversationSearchHighlights();
+      conversationSearchLastNavigatedMatchKeyRef.current = null;
+      conversationSearchManualViewportMatchKeyRef.current = null;
+      const forcedTurnIndex = conversationSearchForcedTurnRef.current;
+      if (forcedTurnIndex !== null) {
+        setForcedRailTurnIndex(current => current === forcedTurnIndex ? null : current);
+        conversationSearchForcedTurnRef.current = null;
+      }
+      return undefined;
+    }
+
+    if (
+      conversationSearchManualViewportMatchKeyRef.current
+      && conversationSearchManualViewportMatchKeyRef.current !== activeConversationSearchMatchKey
+    ) {
+      conversationSearchManualViewportMatchKeyRef.current = null;
+    }
+    if (conversationSearchManualViewportMatchKeyRef.current === activeConversationSearchMatchKey) {
+      conversationSearchPaginationLockRef.current = null;
+      return undefined;
+    }
+
+    conversationSearchPaginationLockRef.current = requestId;
+
+    userDetachedFromBottomRef.current = true;
+    scrollToBottomIntentRef.current = false;
+    clearScrollToBottomSettleTimers();
+    updateShouldAutoScroll(false);
+
+    if (!isActiveConversationSearchMessageLoaded) {
+      const forcedTurnIndex = conversationSearchForcedTurnRef.current;
+      if (forcedTurnIndex !== null) {
+        setForcedRailTurnIndex(current => current === forcedTurnIndex ? null : current);
+        conversationSearchForcedTurnRef.current = null;
+      }
+      if (conversationSearchFailedTargetRef.current === activeConversationSearchMatchKey) {
+        releasePaginationLock();
+        return undefined;
+      }
+      if (conversationSearchLoadingTargetRef.current) return undefined;
+      const targetMatchKey = activeConversationSearchMatchKey;
+      const isTargetRequestCurrent = () => (
+        requestId === conversationSearchNavigationRequestRef.current
+        && conversationSearchViewportLockedRef.current
+        && conversationSearchActiveMatchKeyRef.current === targetMatchKey
+        && conversationSearchManualViewportMatchKeyRef.current !== targetMatchKey
+      );
+      conversationSearchLoadingTargetRef.current = targetMatchKey;
+      logConversationSearchDebug(
+        `Loading message window for search target; absoluteIndex=${activeConversationSearchAbsoluteIndex}.`,
+      );
+      void coworkService.loadMessageWindowAroundIndex(
+        activeConversationSearchSessionId,
+        activeConversationSearchAbsoluteIndex,
+        {
+          expectedMessageId: activeConversationSearchMessageId,
+          isRequestCurrent: isTargetRequestCurrent,
+        },
+      ).then(loaded => {
+        const targetIsStillActive = isTargetRequestCurrent();
+        if (!loaded) {
+          if (targetIsStillActive) {
+            conversationSearchFailedTargetRef.current = targetMatchKey;
+            logConversationSearchWarning('Target message window was unavailable.');
+            window.dispatchEvent(new CustomEvent('app:showToast', {
+              detail: i18nService.t('coworkConversationSearchTargetUnavailable'),
+            }));
+          }
+          releasePaginationLock();
+          return;
+        }
+        if (targetIsStillActive) {
+          logConversationSearchDebug('Loaded message window for active search target.');
+        }
+      }).catch((error: unknown) => {
+        if (conversationSearchActiveMatchKeyRef.current === targetMatchKey) {
+          conversationSearchFailedTargetRef.current = targetMatchKey;
+          logConversationSearchWarning('Failed to load target message window.', error);
+          window.dispatchEvent(new CustomEvent('app:showToast', {
+            detail: i18nService.t('coworkConversationSearchTargetUnavailable'),
+          }));
+        }
+        releasePaginationLock();
+      }).finally(() => {
+        if (conversationSearchLoadingTargetRef.current === targetMatchKey) {
+          conversationSearchLoadingTargetRef.current = null;
+          setConversationSearchLoadVersion(value => value + 1);
+        }
+      });
+      return undefined;
+    }
+
+    conversationSearchLoadingTargetRef.current = null;
+    conversationSearchFailedTargetRef.current = null;
+    const targetTurnIndex = activeConversationSearchTurnIndex;
+    if (targetTurnIndex < 0) {
+      releasePaginationLock();
+      logConversationSearchWarning(
+        `Loaded search target could not be mapped to a conversation turn; absoluteIndex=${activeConversationSearchAbsoluteIndex}.`,
+      );
+      return undefined;
+    }
+
+    conversationSearchForcedTurnRef.current = targetTurnIndex;
+    setForcedRailTurnIndex(targetTurnIndex);
+
+    let settledActiveRange: Range | null = null;
+    const getCurrentTargetRect = (): DOMRect | null => {
+      const container = scrollContainerRef.current;
+      if (!container) return null;
+      if (
+        settledActiveRange
+        && container.contains(settledActiveRange.commonAncestorContainer)
+      ) {
+        const existingRangeRect = settledActiveRange.getBoundingClientRect();
+        if (isUsableConversationSearchRect(existingRangeRect)) {
+          return existingRangeRect;
+        }
+      }
+      const result = applyConversationSearchHighlights(
+        container,
+        conversationSearchQuery,
+        conversationSearchMatches,
+        activeConversationSearchMatchKey,
+      );
+      settledActiveRange = result.activeRange;
+      const rangeRect = result.activeRange?.getBoundingClientRect();
+      if (rangeRect && isUsableConversationSearchRect(rangeRect)) {
+        conversationSearchFallbackElementRef.current?.classList.remove(
+          'cowork-conversation-search-fallback',
+        );
+        conversationSearchFallbackElementRef.current = null;
+        return rangeRect;
+      }
+      const fallbackElement = result.activeElement ?? turnElsCacheRef.current[targetTurnIndex];
+      if (fallbackElement) {
+        conversationSearchFallbackElementRef.current?.classList.remove(
+          'cowork-conversation-search-fallback',
+        );
+        fallbackElement.classList.add('cowork-conversation-search-fallback');
+        conversationSearchFallbackElementRef.current = fallbackElement;
+      }
+      return null;
+    };
+
+    const scheduleSettleChecks = () => {
+      cancelSettleChecks?.();
+      cancelSettleChecks = scheduleConversationSearchSettle({
+        isCurrent: () => (
+          requestId === conversationSearchNavigationRequestRef.current
+          && conversationSearchManualViewportMatchKeyRef.current !== activeConversationSearchMatchKey
+        ),
+        getContainer: () => scrollContainerRef.current,
+        getTargetRect: getCurrentTargetRect,
+        onSettled: ({ correctionCount, observedDelta }) => {
+          logConversationSearchDebug(
+            `Settled active search target; result=${activeConversationSearchMatchIndex + 1}/${conversationSearchMatches.length}; absoluteIndex=${activeConversationSearchAbsoluteIndex}; corrections=${correctionCount}; observedDelta=${Math.round(observedDelta)}.`,
+          );
+        },
+        onTargetUnavailable: () => {
+          logConversationSearchWarning(
+            `Active search target had no visible geometry after settling; absoluteIndex=${activeConversationSearchAbsoluteIndex}.`,
+          );
+        },
+        onError: (error) => {
+          logConversationSearchWarning(
+            `Failed to settle active search target; absoluteIndex=${activeConversationSearchAbsoluteIndex}.`,
+            error,
+          );
+        },
+        onRelease: releasePaginationLock,
+      });
+    };
+
+    const locateTarget = (attempt: number) => {
+      if (requestId !== conversationSearchNavigationRequestRef.current) return;
+      const container = scrollContainerRef.current;
+      if (!container) {
+        releasePaginationLock();
+        return;
+      }
+
+      const result = applyConversationSearchHighlights(
+        container,
+        conversationSearchQuery,
+        conversationSearchMatches,
+        activeConversationSearchMatchKey,
+      );
+
+      const rangeRect = result.activeRange?.getBoundingClientRect();
+      const hasUsableRange = Boolean(rangeRect && isUsableConversationSearchRect(rangeRect));
+      if ((!result.activeElement || (result.activeRange && !hasUsableRange)) && attempt < 10) {
+        frameId = window.requestAnimationFrame(() => locateTarget(attempt + 1));
+        return;
+      }
+
+      if (!result.activeElement) {
+        const fallbackTurn = turnElsCacheRef.current[targetTurnIndex];
+        if (!fallbackTurn) {
+          releasePaginationLock();
+          logConversationSearchWarning(
+            `Active search target turn was unavailable; absoluteIndex=${activeConversationSearchAbsoluteIndex}.`,
+          );
+          return;
+        }
+        fallbackTurn.classList.add('cowork-conversation-search-fallback');
+        conversationSearchFallbackElementRef.current = fallbackTurn;
+        const shouldScroll = conversationSearchLastNavigatedMatchKeyRef.current
+          !== activeConversationSearchMatchKey;
+        conversationSearchLastNavigatedMatchKeyRef.current = activeConversationSearchMatchKey;
+        if (shouldScroll) {
+          logConversationSearchDebug('Using turn-level fallback for search target navigation.');
+          fallbackTurn.scrollIntoView({
+            behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth',
+            block: 'center',
+          });
+        }
+        scheduleSettleChecks();
+        return;
+      }
+
+      if (!result.activeRange || !rangeRect || !hasUsableRange) {
+        settledActiveRange = null;
+        result.activeElement.classList.add('cowork-conversation-search-fallback');
+        conversationSearchFallbackElementRef.current = result.activeElement;
+        const shouldScroll = conversationSearchLastNavigatedMatchKeyRef.current
+          !== activeConversationSearchMatchKey;
+        conversationSearchLastNavigatedMatchKeyRef.current = activeConversationSearchMatchKey;
+        if (shouldScroll) {
+          logConversationSearchDebug('Using message-level fallback for search target navigation.');
+          result.activeElement.scrollIntoView({
+            behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth',
+            block: 'center',
+          });
+        }
+        scheduleSettleChecks();
+        return;
+      }
+
+      settledActiveRange = result.activeRange;
+      const shouldScroll = conversationSearchLastNavigatedMatchKeyRef.current
+        !== activeConversationSearchMatchKey;
+      conversationSearchLastNavigatedMatchKeyRef.current = activeConversationSearchMatchKey;
+      if (shouldScroll) {
+        const delta = getConversationSearchCenterDelta(
+          container.getBoundingClientRect(),
+          container.clientHeight,
+          rangeRect,
+        );
+        const shouldReduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+        const behavior: ScrollBehavior = shouldReduceMotion || Math.abs(delta) > container.clientHeight * 2
+          ? 'auto'
+          : 'smooth';
+        container.scrollTo({ top: container.scrollTop + delta, behavior });
+        logConversationSearchDebug(
+          `Started active search target navigation; result=${activeConversationSearchMatchIndex + 1}/${conversationSearchMatches.length}; absoluteIndex=${activeConversationSearchAbsoluteIndex}; attempt=${attempt}; behavior=${behavior}.`,
+        );
+      }
+      scheduleSettleChecks();
+    };
+
+    frameId = window.requestAnimationFrame(() => {
+      secondFrameId = window.requestAnimationFrame(() => locateTarget(0));
+    });
+
+    return () => {
+      if (frameId !== null) window.cancelAnimationFrame(frameId);
+      if (secondFrameId !== null) window.cancelAnimationFrame(secondFrameId);
+      cancelSettleChecks?.();
+      releasePaginationLock();
+    };
+  }, [
+    activeConversationSearchAbsoluteIndex,
+    activeConversationSearchMatchKey,
+    activeConversationSearchMatchIndex,
+    activeConversationSearchMessageId,
+    activeConversationSearchSessionId,
+    activeConversationSearchTurnIndex,
+    clearScrollToBottomSettleTimers,
+    conversationSearchLoadVersion,
+    conversationSearchMatches,
+    conversationSearchQuery,
+    isActiveConversationSearchMessageLoaded,
+    isConversationSearchOpen,
+    updateShouldAutoScroll,
+  ]);
 
   useEffect(() => {
     const previousSessionId = previousAutoPreviewSessionIdRef.current;
@@ -4508,6 +5568,10 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
 
   // Auto scroll to bottom when new messages arrive or content updates (streaming)
   useEffect(() => {
+    if (isExportingImageRef.current) {
+      // The image exporter owns the scroll position while it stitches chunks.
+      return;
+    }
     if (isNavigatingRef.current) {
       return;
     }
@@ -4568,7 +5632,10 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
   const showExternalSteerPreview = queuedSteerCount > 0 && showPromptAuxiliaryBars;
   const artifactPanelInnerWidth = artifactPanelIsOverlay ? '100%' : artifactPanelFrameWidth;
   const shouldShowTurnNavigationRail = railItems.length > 1 && isScrollable;
-  const shouldShowScrollToBottom = isScrollable && !shouldAutoScroll;
+  const shouldShowScrollToBottom = isScrollable && (
+    !isViewportAtSessionBottom
+    || (!shouldAutoScroll && !isConversationSearchOpen)
+  );
   const expandedConversationPreview = getExpandedConversationPreview(currentSession.messages);
   const resolvedRailIndex = currentRailIndex < 0 || currentRailIndex >= railItems.length
     ? railItems.length - 1
@@ -4587,7 +5654,7 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
   const renderConversationTurns = () => {
     let railCounter = 0;
     if (turns.length === 0) {
-      if (!isStreaming) return null;
+      if (!isSessionBusy) return null;
       return (
         <div data-export-role="assistant-block">
           <AssistantTurnBlock
@@ -4598,7 +5665,10 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
             }}
             resolveLocalFilePath={resolveLocalFilePath}
             localServiceDirectory={currentSession?.cwd}
-            showTypingIndicator
+            showActivityIndicator
+            activityStatusOverride={
+              isContextMaintenance ? i18nService.t('coworkContextMaintenanceRunning') : null
+            }
             showCopyButtons={!isStreaming}
             completedGoal={
               currentSession.goal?.status === CoworkGoalStatus.Complete
@@ -4608,6 +5678,8 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
             planConfirmationMessageId={planConfirmationMessageId}
             onConfirmPlan={handleConfirmPlan}
             onAdjustPlan={handleAdjustPlan}
+            searchTargetMessageId={activeConversationSearchMatch?.messageId}
+            isStreamingTurn
           />
         </div>
       );
@@ -4615,10 +5687,16 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
 
     return turns.map((turn, index) => {
       const isLastTurn = index === turns.length - 1;
-      const showTypingIndicator = isStreaming && isLastTurn && !hasRenderableAssistantContent(turn);
-      const showAssistantBlock = turn.assistantItems.length > 0 || showTypingIndicator;
-      // Always render last 3 turns (needed for streaming, auto-scroll, and smooth UX)
-      const alwaysRender = index >= turns.length - 3 || index === forcedRailTurnIndex;
+      // Persistent busy-state indicator at the insertion point of the
+      // running turn (Codex/ChatGPT style: visible for the whole run).
+      const showActivityIndicator = isSessionBusy && isLastTurn;
+      const showAssistantBlock = turn.assistantItems.length > 0 || showActivityIndicator;
+      // Always render last 3 turns (needed for streaming, auto-scroll, and smooth UX).
+      // While exporting the conversation image, force-render every turn:
+      // lazy placeholders have no export anchors and capture as blank blocks.
+      const alwaysRender = index >= turns.length - 3
+        || index === forcedRailTurnIndex
+        || isExportingImage;
 
       // Compute one rail index per conversation turn (must match grouped rail item logic).
       const hasAssistantContent = turn.assistantItems.some(
@@ -4630,6 +5708,12 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
       const turnMessageIds = getTurnMessageIds(turn);
       const turnArtifacts = rawSessionArtifacts.filter(
         a => turnMessageIds.has(a.messageId) && PREVIEWABLE_ARTIFACT_TYPES.has(a.type)
+      );
+      // Subagents spawned in this turn that are still working keep the
+      // turn's process unfolded until they finish.
+      const turnHasRunningSubagents = turn.assistantItems.some(
+        item => item.type === 'tool_group'
+          && getToolGroupSubagents(item.group).some(subagent => subagent.status === 'running'),
       );
 
       return (
@@ -4645,8 +5729,10 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
                 message={turn.userMessage}
                 skills={skills}
                 marketplaceKits={marketplaceKits}
+                sessionId={sessionId}
                 onReEdit={remoteManaged ? undefined : handleReEdit}
                 onLocateSelectedText={handleLocateSelectedText}
+                onOpenAnnotation={handleOpenMessageAnnotation}
               />
             </div>
           )}
@@ -4667,19 +5753,22 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
                 onDeployLocalService={handleDeployLocalServiceArtifact}
                 onOpenHtmlFile={handleOpenHtmlFileInBrowser}
                 onForkMessage={remoteManaged ? undefined : handleForkMessage}
-                renderToolGroupFooter={(group) => {
+                renderToolGroupOverride={(group) => {
                   const groupSubagents = getToolGroupSubagents(group);
                   if (groupSubagents.length === 0) return null;
                   return (
-                    <SubagentTurnLinks
+                    <SubagentSpawnCard
                       subagents={groupSubagents}
-                      variant="tool"
                       onSelectSubagent={handleSelectSubagent}
                     />
                   );
                 }}
-                showTypingIndicator={showTypingIndicator}
+                showActivityIndicator={showActivityIndicator}
+                activityStatusOverride={
+                  isContextMaintenance ? i18nService.t('coworkContextMaintenanceRunning') : null
+                }
                 showCopyButtons={!isStreaming || !isLastTurn}
+                hiddenSystemMessageId={enterpriseQuotaPromptMessageId}
                 completedGoal={
                   isLastTurn && currentSession.goal?.status === CoworkGoalStatus.Complete
                     ? currentSession.goal
@@ -4688,6 +5777,9 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
                 planConfirmationMessageId={planConfirmationMessageId}
                 onConfirmPlan={handleConfirmPlan}
                 onAdjustPlan={handleAdjustPlan}
+                searchTargetMessageId={activeConversationSearchMatch?.messageId}
+                isStreamingTurn={isStreaming && isLastTurn}
+                hasRunningSubagents={turnHasRunningSubagents}
               />
             </div>
           )}
@@ -4702,7 +5794,7 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
       {/* Header — spans full width */}
       <div
         data-skin-session-titlebar="true"
-        className={`draggable flex h-12 items-center justify-between border-b border-border bg-background shrink-0 ${
+        className={`draggable relative z-30 flex h-12 shrink-0 items-center justify-between overflow-visible border-b border-border bg-background ${
           isArtifactPanelExpanded ? 'pl-0 pr-4' : 'px-4'
         }`}
       >
@@ -4732,8 +5824,22 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
           </h1>
         </div>
 
-        {/* Right side: Artifact toggle */}
-        <div
+        {isConversationSearchOpen ? (
+          <CoworkConversationSearch
+            query={conversationSearchQuery}
+            status={conversationSearchStatus}
+            errorReason={conversationSearchErrorReason}
+            activeMatchIndex={activeConversationSearchMatchIndex}
+            resultCount={conversationSearchMatches.length}
+            isResultLimitReached={isConversationSearchResultLimitReached}
+            focusRequestKey={conversationSearchFocusRequestKey}
+            onQueryChange={setConversationSearchQuery}
+            onNavigate={navigateConversationSearch}
+            onClose={closeConversationSearch}
+          />
+        ) : (
+          /* Right side: Artifact toggle */
+          <div
           className={`flex h-full shrink-0 items-center gap-1 ${
             isArtifactPanelVisible
               ? isArtifactPanelExpanded
@@ -4851,6 +5957,41 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
                         onClick={(event) => {
                           event.stopPropagation();
                           handleCloseArtifactSubagentTab();
+                        }}
+                        className={artifactTabCloseButtonClassName}
+                        title={i18nService.t('artifactCloseTab')}
+                      >
+                        <ArtifactTabCloseIcon className="h-2.5 w-2.5" />
+                      </button>
+                    </div>
+                  )}
+                  {isUserAttachmentPreviewTabOpen && (
+                    <div
+                      data-artifact-preview-active={
+                        !activeArtifactPreviewTab && activeSpecialPreviewTab === ArtifactSpecialTab.UserAttachment
+                          ? 'true'
+                          : undefined
+                      }
+                      className={`non-draggable group flex h-7 max-w-[190px] items-center rounded-lg text-xs transition-colors ${
+                        activeArtifactPreviewTab || activeSpecialPreviewTab !== ArtifactSpecialTab.UserAttachment
+                          ? 'text-secondary hover:bg-surface hover:text-foreground'
+                          : 'bg-surface-raised text-foreground shadow-sm'
+                      }`}
+                    >
+                      <button
+                        type="button"
+                        onClick={handleActivateArtifactUserAttachmentTab}
+                        className="flex min-w-0 items-center gap-1.5 px-2 text-left"
+                        title={i18nService.t('artifactUserAttachmentTab')}
+                      >
+                        <PaperClipIcon className="h-3.5 w-3.5 shrink-0" />
+                        <span className="truncate">{i18nService.t('artifactUserAttachmentTab')}</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          handleCloseArtifactUserAttachmentTab();
                         }}
                         className={artifactTabCloseButtonClassName}
                         title={i18nService.t('artifactCloseTab')}
@@ -4980,13 +6121,23 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
           )}
           <button
             type="button"
+            onClick={handleOpenConversationSearch}
+            className="non-draggable relative h-8 w-8 inline-flex items-center justify-center rounded-lg text-secondary hover:bg-surface-raised transition-colors"
+            aria-label={i18nService.t('coworkConversationSearchOpen')}
+            title={i18nService.t('coworkConversationSearchOpen')}
+          >
+            <SidebarSearchIcon className="h-[18px] w-[18px]" />
+          </button>
+          <button
+            type="button"
             onClick={handleToggleArtifactPanel}
             className="non-draggable relative h-8 w-8 inline-flex items-center justify-center rounded-lg text-secondary hover:bg-surface-raised transition-colors"
             aria-label={i18nService.t('artifactPanelToggle')}
           >
             <ArtifactPanelIcon className="h-4 w-4" open={isPanelOpen} />
           </button>
-        </div>
+          </div>
+        )}
       </div>
 
       {showArtifactAddMenu && artifactAddMenuPosition && createPortal(
@@ -5092,6 +6243,36 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
         document.body
       )}
 
+      {/* Export image progress overlay: a transparent input blocker so user
+          scrolling cannot break chunk stitching, plus a status pill pinned to
+          the window's top edge — above the capture rect, so it is never baked
+          into the exported chunks. */}
+      {exportImageProgress && createPortal(
+        <div className="fixed inset-0 z-[10050]" style={{ cursor: 'progress' }}>
+          <div className="absolute left-1/2 top-3 flex -translate-x-1/2 items-center gap-2.5 rounded-full border border-border bg-surface py-1.5 pl-4 pr-2 shadow-elevated">
+            <div className="h-3.5 w-3.5 shrink-0 animate-spin rounded-full border-2 border-primary border-t-transparent" />
+            <span className="whitespace-nowrap text-xs font-medium text-foreground">
+              {exportImageProgress.phase === 'loading'
+                ? i18nService.t('coworkExportImagePreparing')
+                : i18nService.t('coworkExportImageInProgress')}
+              {exportImageProgress.phase !== 'saving'
+                && exportImageProgress.current !== undefined
+                && exportImageProgress.total !== undefined
+                && exportImageProgress.total > 0
+                && ` (${exportImageProgress.current}/${exportImageProgress.total})`}
+            </span>
+            <button
+              type="button"
+              onClick={handleCancelExportImage}
+              className="shrink-0 rounded-full px-2 py-0.5 text-xs text-secondary transition-colors hover:bg-surface-raised hover:text-foreground"
+            >
+              {i18nService.t('cancel')}
+            </button>
+          </div>
+        </div>,
+        document.body
+      )}
+
       {/* Content row: chat + artifact panel */}
       <div ref={contentRowRef} className="relative flex-1 flex overflow-hidden">
       <div
@@ -5105,10 +6286,10 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
           onScroll={handleMessagesScroll}
           onWheel={handleMessagesWheel}
           onMouseUp={handleAssistantTextSelection}
-          className="relative h-full min-h-0 overflow-y-auto pt-3"
+          className={`relative h-full min-h-0 overflow-y-auto pt-3${exportImageProgress ? ' cowork-export-capturing' : ''}`}
           style={{ scrollbarGutter: 'stable both-edges' }}
         >
-          {selectedTextAction && (
+          {selectedTextAction && !exportImageProgress && (
             <SelectedTextActionToolbar
               left={selectedTextAction.left}
               top={selectedTextAction.top}
@@ -5136,7 +6317,7 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
         </div>
 
         {/* Turn Navigation Rail — to the left of scrollbar */}
-        {shouldShowTurnNavigationRail && (
+        {shouldShowTurnNavigationRail && !exportImageProgress && (
           <div
             className="absolute right-[18px] top-1/2 -translate-y-1/2 w-5 flex flex-col items-end z-10"
             style={{ maxHeight: 'calc(100% - 40px)' }}
@@ -5283,7 +6464,7 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
           </div>,
           document.body
         )}
-        {shouldShowScrollToBottom && (
+        {shouldShowScrollToBottom && !exportImageProgress && (
           <button
             type="button"
             onClick={handleScrollToBottom}
@@ -5296,9 +6477,6 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
           </button>
         )}
       </div>
-
-      {/* Streaming Activity Bar */}
-      {isSessionBusy && <StreamingActivityBar messages={currentSession.messages} isContextMaintenance={isContextMaintenance} />}
 
       {/* Input Area */}
       <div
@@ -5461,7 +6639,6 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
                               content={item.content}
                               className="prose dark:prose-invert max-w-none text-xs leading-5"
                               resolveLocalFilePath={resolveLocalFilePath}
-                              showRevealInFolderAction
                             />
                           )}
                         </div>
@@ -5480,12 +6657,14 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
           </div>
         )}
         <div ref={promptContentAnchorRef} className={COWORK_DETAIL_CONTENT_CLASS}>
+          <EnterpriseQuotaPrompt signal={activeEnterpriseQuotaSignal} surface="task" />
           {btwThread && (
             <CoworkBtwFloatingPanel
               thread={btwThread}
               promptAnchorRef={promptContentAnchorRef}
               resolveLocalFilePath={resolveLocalFilePath}
               onClose={() => dispatch(closeBtwThread(btwThread.sessionId))}
+              onClearEntries={() => dispatch(clearBtwEntries(btwThread.sessionId))}
               onDraftChange={draft => dispatch(setBtwDraft({
                 sessionId: btwThread.sessionId,
                 draft,
@@ -5522,6 +6701,7 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
             canSteer={isStreaming && !isContextBusy}
             placeholder={i18nService.t(remoteManaged ? 'coworkRemoteManagedPlaceholder' : 'coworkContinuePlaceholder')}
             disabled={remoteManaged}
+            submitDisabled={Boolean(activeEnterpriseQuotaSignal)}
             size={isArtifactPanelExpanded ? 'compact' : 'large'}
             remoteManaged={remoteManaged}
             onManageSkills={remoteManaged ? undefined : onManageSkills}
@@ -5644,6 +6824,13 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
                   onSelectSubagent={handleSelectSubagent}
                 />
               )}
+              userAttachmentPanel={(
+                <UserAttachmentPanelContent
+                  sessionId={currentSession.id}
+                  payload={userAttachmentPreview}
+                />
+              )}
+              onAnnotationSend={handleAnnotationSendRequest}
               onAddSelectedText={addSelectedTextSnippetToDraft}
               selectedTextEnabled={!remoteManaged}
             />

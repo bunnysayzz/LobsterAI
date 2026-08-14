@@ -11,23 +11,32 @@ import {
   isManualDownloadUrl,
 } from '../shared/appUpdate/constants';
 import { ProviderAuthType, ProviderName, ProviderRegistry } from '../shared/providers';
+import { SIDEBAR_TASK_FILTER_ENABLED } from './components/agentSidebar/SidebarTaskFilterButton';
 import { CoworkView } from './components/cowork';
-import { CoworkShortcutDirection, CoworkUiEvent } from './components/cowork/constants';
+import {
+  CoworkShortcutDirection,
+  type CoworkTaskSearchRequestEventDetail,
+  CoworkTaskSearchRequestSource,
+  CoworkUiEvent,
+} from './components/cowork/constants';
+import {
+  ConversationSearchShortcutTarget,
+  resolveConversationSearchShortcutTarget,
+} from './components/cowork/conversationSearchShortcut';
 import CoworkPermissionModal from './components/cowork/CoworkPermissionModal';
 import CoworkQuestionWizard from './components/cowork/CoworkQuestionWizard';
 import EngineFailureOverlay from './components/cowork/EngineFailureOverlay';
 import EngineStartupOverlay from './components/cowork/EngineStartupOverlay';
 import KitsView from './components/kits/KitsView';
-import { McpView } from './components/mcp';
 import { ScheduledTasksView } from './components/scheduledTasks';
 import Settings, { type SettingsOpenOptions } from './components/Settings';
 import Sidebar from './components/Sidebar';
 import { SitesView } from './components/sites';
-import { SkillsView } from './components/skills';
+import { SkillsAndConnectorsView, SkillsConnectorsSection } from './components/skillsAndConnectors';
 import SkinBackdrop, { SkinBackdropVariant } from './components/skin/SkinBackdrop';
 import SkinPresentationScope from './components/skin/SkinPresentationScope';
 import StartupCreditCampaign from './components/StartupCreditCampaign';
-import Toast from './components/Toast';
+import Toast, { type ToastEventDetail } from './components/Toast';
 import AppUpdateBadge from './components/update/AppUpdateBadge';
 import AppUpdateBlockingPanel from './components/update/AppUpdateBlockingPanel';
 import AppUpdateCard from './components/update/AppUpdateCard';
@@ -42,6 +51,7 @@ import WelcomeDialog from './components/WelcomeDialog';
 import WindowsAppTitleBar from './components/window/WindowsAppTitleBar';
 import WindowTitleBar from './components/window/WindowTitleBar';
 import { defaultConfig, getProviderDisplayName, ShortcutAction } from './config';
+import { selectIsEnterpriseAccount } from './features/enterpriseAccount/selectors';
 import { SkinProvider } from './providers/SkinProvider';
 import type { ApiConfig } from './services/api';
 import { apiService } from './services/api';
@@ -50,9 +60,14 @@ import { configService } from './services/config';
 import { coworkService } from './services/cowork';
 import { isTestModeEnabled } from './services/endpoints';
 import { i18nService } from './services/i18n';
+import {
+  beginLatestAsyncRequest,
+  invalidateLatestAsyncRequest,
+  isLatestAsyncRequest,
+} from './services/latestAsyncRequest';
 import { LogReporterAction, reportYdAnalyzer } from './services/logReporter';
 import { scheduledTaskService } from './services/scheduledTask';
-import { matchesShortcut } from './services/shortcuts';
+import { isTextEditingSafeShortcut, matchesShortcut } from './services/shortcuts';
 import { themeService } from './services/theme';
 import { applyTypographyPreferences } from './services/typography';
 import { RootState, store } from './store';
@@ -67,10 +82,12 @@ import {
   setDraftCollaborationMode,
   setDraftKitIds,
   setDraftPrompt,
+  setDraftSkillIds,
 } from './store/slices/coworkSlice';
 import { setActiveKitIds } from './store/slices/kitSlice';
 import { setAvailableModels, setDefaultSelectedModel } from './store/slices/modelSlice';
 import { clearSelection } from './store/slices/quickActionSlice';
+import { setActiveSkillIds } from './store/slices/skillSlice';
 import { CoworkCollaborationMode, type CoworkPermissionResult } from './types/cowork';
 
 const AGENT_TASK_SLOT_SHORTCUT_ACTIONS = [
@@ -99,13 +116,29 @@ const SETTINGS_TAB_SHORTCUT_ACTIONS: Array<{
   { action: ShortcutAction.OpenSettingsMemory, initialTab: 'coworkMemory' },
   { action: ShortcutAction.OpenSettingsDreaming, initialTab: 'coworkDreaming' },
   { action: ShortcutAction.OpenSettingsPlugins, initialTab: 'plugins' },
-  { action: ShortcutAction.OpenSettingsShortcuts, initialTab: 'shortcuts' },
   { action: ShortcutAction.OpenSettingsAbout, initialTab: 'about' },
 ];
 
 /** Used for config + i18n init; longer on Windows where main-process IPC can stall during cold start. */
 const INIT_STEP_TIMEOUT_MS_WINDOWS = 24_000;
 const INIT_STEP_TIMEOUT_MS_DEFAULT = 16_000;
+/** Field evidence (2026-08): early renderer↔main invokes can stall ~25-30s and
+ * then recover, so retries with fresh invokes rescue startup where a single
+ * long timeout cannot. */
+const INIT_STEP_RETRY_TIMEOUT_MS = 8_000;
+const INIT_CONFIG_MAX_ATTEMPTS = 3;
+const INIT_AUTO_RETRY_DELAY_MS = 8_000;
+const INIT_AUTO_RETRY_MAX = 2;
+const INIT_CONFIG_REPAIR_DELAY_MS = 15_000;
+const INIT_CONFIG_REPAIR_MAX = 4;
+const INIT_REQUIRED_GATE_MAX_ATTEMPTS = 2;
+
+export const InitPassMode = {
+  Startup: 'startup',
+  Retry: 'retry',
+  Repair: 'repair',
+} as const;
+export type InitPassMode = typeof InitPassMode[keyof typeof InitPassMode];
 
 const logAppUpdateRendererLifecycle = (
   message: string,
@@ -129,9 +162,11 @@ const App: React.FC = () => {
   const [mainView, setMainView] = useState<'cowork' | 'skills' | 'scheduledTasks' | 'kits' | 'mcp' | 'sites'>('cowork');
   const [isInitialized, setIsInitialized] = useState(false);
   const [initError, setInitError] = useState<string | null>(null);
-  const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const [toastMessage, setToastMessage] = useState<ToastEventDetail | null>(null);
   const [, forceLanguageRefresh] = useState(0);
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
+  const [isTaskFilterActive, setIsTaskFilterActive] = useState(false);
+  const [hasUnreadCompletedTasks, setHasUnreadCompletedTasks] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(244);
   const [appUpdateState, setAppUpdateState] = useState<AppUpdateRuntimeState>({
     status: AppUpdateStatus.Idle,
@@ -151,10 +186,19 @@ const App: React.FC = () => {
     ui?: Record<string, 'hide' | 'disable' | 'readonly'>;
     disableUpdate?: boolean;
   } | null>(null);
+  const [enterpriseConfigLoaded, setEnterpriseConfigLoaded] = useState(false);
   const toastTimerRef = useRef<number | null>(null);
   const askAiFocusTimerRef = useRef<number | null>(null);
   const hasInitialized = useRef(false);
   const hasReportedAppStartedRef = useRef(false);
+  const initPassRunningRef = useRef(false);
+  const initRetryTimerRef = useRef<number | null>(null);
+  const initAutoRetryCountRef = useRef(0);
+  const initRepairCountRef = useRef(0);
+  const requiredStartupGatesReadyRef = useRef(false);
+  const coreStartupServicesInitializedRef = useRef(false);
+  const enterpriseGateRequestIdRef = useRef(0);
+  const privacyGateRequestIdRef = useRef(0);
   const previousUpdateStatusRef = useRef<AppUpdateRuntimeState['status']>(AppUpdateStatus.Idle);
   const shouldInstallReadyUpdateRef = useRef(false);
   const isUserInitiatedUpdateFlowActiveRef = useRef(false);
@@ -164,6 +208,7 @@ const App: React.FC = () => {
   const pendingPermission = useSelector(selectFirstCurrentSessionPendingPermission);
   const pendingPermissions = useSelector(selectPendingPermissions);
   const authUser = useSelector((state: RootState) => state.auth.user);
+  const isEnterpriseAccount = useSelector(selectIsEnterpriseAccount);
   const isWindows = window.electron.platform === 'win32';
   const [minimizedPermissionIds, setMinimizedPermissionIds] = useState<string[]>([]);
   const isPendingPermissionMinimized = pendingPermission
@@ -198,120 +243,303 @@ const App: React.FC = () => {
   );
 
   // 初始化应用
+  const applyConfigToApp = useCallback((log?: (label: string) => void) => {
+    const config = configService.getConfig();
+    applyTypographyPreferences(config);
+    const apiConfig: ApiConfig = {
+      apiKey: config.api.key,
+      baseUrl: config.api.baseUrl,
+    };
+    apiService.setConfig(apiConfig);
+
+    const providerModels: { id: string; name: string; provider?: string; providerKey?: string; openClawProviderId?: string; supportsImage?: boolean }[] = [];
+    if (config.providers) {
+      Object.entries(config.providers).forEach(([providerName, providerConfig]) => {
+        if (providerConfig.enabled && providerConfig.models) {
+          const openClawProviderId = ProviderRegistry.getOpenClawProviderIdForConfig(providerName, providerConfig);
+          if (providerName === ProviderName.Minimax && providerConfig.authType === ProviderAuthType.OAuth) {
+            log?.('MiniMax OAuth provider resolved to OpenClaw minimax-portal');
+          }
+          providerConfig.models.forEach((model: { id: string; name: string; supportsImage?: boolean }) => {
+            providerModels.push({
+              id: model.id,
+              name: model.name,
+              provider: getProviderDisplayName(providerName, providerConfig),
+              providerKey: providerName,
+              openClawProviderId,
+              supportsImage: model.supportsImage ?? false,
+            });
+          });
+        }
+      });
+    }
+    dispatch(setAvailableModels(providerModels));
+    if (providerModels.length > 0) {
+      const allModels = store.getState().model.availableModels;
+      const preferredModel = allModels.find(
+        model => model.id === config.model.defaultModel
+          && (!config.model.defaultModelProvider || model.providerKey === config.model.defaultModelProvider)
+      ) ?? allModels[0];
+      dispatch(setDefaultSelectedModel(preferredModel));
+    }
+    return providerModels;
+  }, [dispatch]);
+
+  const runInitPassRef = useRef<(mode: InitPassMode) => void>(() => {});
+
+  const runInitPass = useCallback(async (mode: InitPassMode): Promise<void> => {
+    if (initPassRunningRef.current) {
+      return;
+    }
+    initPassRunningRef.current = true;
+    if (initRetryTimerRef.current !== null) {
+      window.clearTimeout(initRetryTimerRef.current);
+      initRetryTimerRef.current = null;
+    }
+
+    const t0 = performance.now();
+    const log = (level: 'info' | 'error', label: string) => {
+      const elapsed = Math.round(performance.now() - t0);
+      const msg = `initializeApp: ${label} (+${elapsed}ms)`;
+      if (level === 'error') {
+        console.error(`[App] ${msg}`);
+      } else {
+        console.info(`[App] ${msg}`);
+      }
+      try { window.electron?.log?.fromRenderer?.(level, 'App', msg); } catch { /* preload may not expose this yet */ }
+    };
+    const mark = (label: string) => log('info', label);
+    const markError = (label: string) => log('error', label);
+
+    const scheduleNextPass = (nextMode: InitPassMode, delayMs: number) => {
+      initRetryTimerRef.current = window.setTimeout(() => {
+        initRetryTimerRef.current = null;
+        runInitPassRef.current(nextMode);
+      }, delayMs);
+    };
+
+    // Runs one init step; retries issue a FRESH invoke because a timed-out
+    // promise is left running (its late completion must stay harmless).
+    const runStep = async (
+      label: string,
+      run: () => Promise<unknown>,
+      opts: { attempts: number; firstTimeoutMs: number },
+    ): Promise<boolean> => {
+      for (let attempt = 1; attempt <= opts.attempts; attempt++) {
+        const timeoutMs = attempt === 1 ? opts.firstTimeoutMs : INIT_STEP_RETRY_TIMEOUT_MS;
+        try {
+          await waitWithTimeout(run(), timeoutMs, label);
+          if (attempt > 1) {
+            mark(`${label} recovered on attempt ${attempt}`);
+          }
+          return true;
+        } catch (error) {
+          const msg = error instanceof Error ? error.message : String(error);
+          markError(`${label} attempt ${attempt}/${opts.attempts} failed: ${msg}`);
+        }
+      }
+      return false;
+    };
+
+    const finishShell = (providerModelCount: number, readyLabel: string) => {
+      if (!requiredStartupGatesReadyRef.current) {
+        throw new Error('Required privacy and enterprise startup gates are unresolved.');
+      }
+      setIsInitialized(true);
+      setInitError(null);
+      mark(readyLabel);
+      if (!hasReportedAppStartedRef.current) {
+        hasReportedAppStartedRef.current = true;
+        void reportYdAnalyzer({
+          action: LogReporterAction.AppStarted,
+          providerModelCount,
+          hasLoggedInUser: !!store.getState().auth.user?.yid,
+        });
+      }
+    };
+
+    try {
+      mark(`start (mode=${mode})`);
+      document.documentElement.classList.add(`platform-${window.electron.platform}`);
+
+      const initTimeoutMs =
+        window.electron.platform === 'win32'
+          ? INIT_STEP_TIMEOUT_MS_WINDOWS
+          : INIT_STEP_TIMEOUT_MS_DEFAULT;
+      const isRepair = mode === InitPassMode.Repair;
+
+      // Privacy consent and enterprise UI policy are authorization gates, not
+      // optional startup data. Resolve them before any degraded/default-config
+      // path can expose the application shell. Both calls run in parallel and
+      // use fresh IPC invokes on retry to recover from an early renderer/main
+      // handshake stall.
+      if (!requiredStartupGatesReadyRef.current) {
+        const [enterpriseReady, privacyReady] = await Promise.all([
+          runStep('enterprise.getConfig', async () => {
+            const requestId = beginLatestAsyncRequest(enterpriseGateRequestIdRef);
+            const result = await window.electron.enterprise.getConfig();
+            if (!isLatestAsyncRequest(enterpriseGateRequestIdRef, requestId)) return;
+            if (!result.success) {
+              throw new Error(result.error || 'Enterprise UI config is unavailable.');
+            }
+            setEnterpriseConfig(result.config);
+            setEnterpriseConfigLoaded(true);
+          }, {
+            attempts: INIT_REQUIRED_GATE_MAX_ATTEMPTS,
+            firstTimeoutMs: INIT_STEP_RETRY_TIMEOUT_MS,
+          }),
+          runStep('privacy check', async () => {
+            const requestId = beginLatestAsyncRequest(privacyGateRequestIdRef);
+            const agreed = await window.electron.store.get('privacy_agreed');
+            if (!isLatestAsyncRequest(privacyGateRequestIdRef, requestId)) return;
+            setPrivacyAgreed(agreed === true);
+          }, {
+            attempts: INIT_REQUIRED_GATE_MAX_ATTEMPTS,
+            firstTimeoutMs: INIT_STEP_RETRY_TIMEOUT_MS,
+          }),
+        ]);
+        if (!enterpriseReady || !privacyReady) {
+          throw new Error(
+            `Required startup gates unavailable (enterprise=${enterpriseReady}, privacy=${privacyReady}).`,
+          );
+        }
+        requiredStartupGatesReadyRef.current = true;
+        mark('required privacy and enterprise gates done');
+      }
+
+      mark('configService.init begin');
+      const configReady = await runStep('configService.init', () => configService.init(), {
+        attempts: isRepair ? 2 : INIT_CONFIG_MAX_ATTEMPTS,
+        firstTimeoutMs: isRepair ? INIT_STEP_RETRY_TIMEOUT_MS : initTimeoutMs,
+      });
+
+      if (!configReady) {
+        if (isRepair) {
+          if (initRepairCountRef.current < INIT_CONFIG_REPAIR_MAX) {
+            initRepairCountRef.current += 1;
+            markError(`config repair still failing — retry ${initRepairCountRef.current}/${INIT_CONFIG_REPAIR_MAX} in ${INIT_CONFIG_REPAIR_DELAY_MS}ms`);
+            scheduleNextPass(InitPassMode.Repair, INIT_CONFIG_REPAIR_DELAY_MS);
+          } else {
+            markError('config repair attempts exhausted — app keeps default config until next launch');
+          }
+          return;
+        }
+        // Keep the application usable on defaults while a background pass
+        // repairs persisted config. Core services still initialize below so
+        // auth/listeners and scheduled tasks are never skipped.
+        markError('configService.init unavailable — starting with default config, background repair scheduled');
+        initRepairCountRef.current = 1;
+      } else {
+        mark('configService.init done');
+      }
+
+      if (isRepair) {
+        const repairedModels = applyConfigToApp(mark);
+        const repairedConfig = configService.getConfig();
+        themeService.applyPersistedSelection({
+          mode: repairedConfig.theme,
+          themeId: repairedConfig.themeId,
+        });
+        i18nService.setLanguage(repairedConfig.language, { persist: false });
+        mark(`config repaired and applied (${repairedModels.length} provider models)`);
+        return;
+      }
+
+      if (!coreStartupServicesInitializedRef.current) {
+        themeService.initialize();
+        mark('themeService done');
+
+        mark('i18nService.initialize begin');
+        const i18nReady = await runStep('i18nService.initialize', () => i18nService.initialize(), {
+          // Keep one invocation alive after a timeout. Starting a concurrent
+          // locale initialization would let late IPC results race each other.
+          attempts: 1,
+          firstTimeoutMs: initTimeoutMs,
+        });
+        mark(i18nReady ? 'i18nService.initialize done' : 'i18nService.initialize degraded — using persisted language hint');
+
+        // Single attempt: authService.init() re-entry tears down listeners, so a
+        // concurrent retry could stack them; its in-flight run self-completes
+        // once IPC recovers.
+        mark('authService.init begin');
+        const authReady = await runStep('authService.init', () => authService.init(), {
+          attempts: 1,
+          firstTimeoutMs: INIT_STEP_RETRY_TIMEOUT_MS,
+        });
+        mark(authReady ? 'authService.init done' : 'authService.init pending (auth restore completes in background)');
+        coreStartupServicesInitializedRef.current = true;
+      }
+
+      const providerModels = applyConfigToApp(mark);
+      mark('model resolution done');
+
+      finishShell(
+        providerModels.length,
+        configReady ? 'shell ready' : 'shell ready (degraded: default config)',
+      );
+
+      void waitWithTimeout(scheduledTaskService.init(), 5000, 'scheduledTaskService.init').catch((error) => {
+        console.error('[App] initializeApp: scheduledTaskService.init failed:', error);
+      });
+
+      if (!configReady) {
+        // Schedule only after the startup pass releases its in-flight guard;
+        // otherwise a slow core-service init can consume and lose the timer.
+        scheduleNextPass(InitPassMode.Repair, INIT_CONFIG_REPAIR_DELAY_MS);
+      }
+
+    } catch (error) {
+      const elapsed = Math.round(performance.now() - t0);
+      const msg = error instanceof Error ? error.message : String(error);
+      const detail = `initializeApp FAILED after ${elapsed}ms (mode=${mode}): ${msg}`;
+      console.error(`[App] ${detail}`);
+      try { window.electron?.log?.fromRenderer?.('error', 'App', detail); } catch { /* best-effort */ }
+      if (mode === InitPassMode.Repair) {
+        // The shell is already up in degraded mode — never replace it with the
+        // error page from a background pass.
+        return;
+      }
+      setInitError(i18nService.t('initializationError'));
+      setIsInitialized(true);
+      if (initAutoRetryCountRef.current < INIT_AUTO_RETRY_MAX) {
+        initAutoRetryCountRef.current += 1;
+        markError(`scheduling automatic init retry ${initAutoRetryCountRef.current}/${INIT_AUTO_RETRY_MAX} in ${INIT_AUTO_RETRY_DELAY_MS}ms`);
+        // Retries silently behind the error page; success swaps straight into
+        // the app without flashing the loading screen.
+        scheduleNextPass(InitPassMode.Retry, INIT_AUTO_RETRY_DELAY_MS);
+      }
+    } finally {
+      initPassRunningRef.current = false;
+    }
+  }, [applyConfigToApp, waitWithTimeout]);
+
+  useEffect(() => {
+    runInitPassRef.current = (mode: InitPassMode) => { void runInitPass(mode); };
+  }, [runInitPass]);
+
+  const handleInitRetry = useCallback(() => {
+    if (initPassRunningRef.current) {
+      return;
+    }
+    initAutoRetryCountRef.current = 0;
+    setInitError(null);
+    setIsInitialized(false);
+    void runInitPass(InitPassMode.Retry);
+  }, [runInitPass]);
+
   useEffect(() => {
     if (hasInitialized.current) {
       return;
     }
     hasInitialized.current = true;
+    void runInitPass(InitPassMode.Startup);
+  }, [runInitPass]);
 
-    const initializeApp = async () => {
-      const t0 = performance.now();
-      const mark = (label: string) => {
-        const elapsed = Math.round(performance.now() - t0);
-        const msg = `initializeApp: ${label} (+${elapsed}ms)`;
-        console.info(`[App] ${msg}`);
-        try { window.electron?.log?.fromRenderer?.('info', 'App', msg); } catch { /* preload may not expose this yet */ }
-      };
-
-      try {
-        mark('start');
-        document.documentElement.classList.add(`platform-${window.electron.platform}`);
-
-        const initTimeoutMs =
-          window.electron.platform === 'win32'
-            ? INIT_STEP_TIMEOUT_MS_WINDOWS
-            : INIT_STEP_TIMEOUT_MS_DEFAULT;
-        mark('configService.init begin');
-        await waitWithTimeout(configService.init(), initTimeoutMs, 'configService.init');
-        mark('configService.init done');
-
-        const entConfig = await window.electron.enterprise.getConfig();
-        setEnterpriseConfig(entConfig);
-        mark('enterprise.getConfig done');
-
-        themeService.initialize();
-        mark('themeService done');
-
-        mark('i18nService.initialize begin');
-        await waitWithTimeout(i18nService.initialize(), initTimeoutMs, 'i18nService.initialize');
-        mark('i18nService.initialize done');
-
-        mark('authService.init begin');
-        await authService.init();
-        mark('authService.init done');
-
-        const config = await configService.getConfig();
-        applyTypographyPreferences(config);
-        const apiConfig: ApiConfig = {
-          apiKey: config.api.key,
-          baseUrl: config.api.baseUrl,
-        };
-        apiService.setConfig(apiConfig);
-
-        const providerModels: { id: string; name: string; provider?: string; providerKey?: string; openClawProviderId?: string; supportsImage?: boolean }[] = [];
-        if (config.providers) {
-          Object.entries(config.providers).forEach(([providerName, providerConfig]) => {
-            if (providerConfig.enabled && providerConfig.models) {
-              const openClawProviderId = ProviderRegistry.getOpenClawProviderIdForConfig(providerName, providerConfig);
-              if (providerName === ProviderName.Minimax && providerConfig.authType === ProviderAuthType.OAuth) {
-                mark('MiniMax OAuth provider resolved to OpenClaw minimax-portal');
-              }
-              providerConfig.models.forEach((model: { id: string; name: string; supportsImage?: boolean }) => {
-                providerModels.push({
-                  id: model.id,
-                  name: model.name,
-                  provider: getProviderDisplayName(providerName, providerConfig),
-                  providerKey: providerName,
-                  openClawProviderId,
-                  supportsImage: model.supportsImage ?? false,
-                });
-              });
-            }
-          });
-        }
-        dispatch(setAvailableModels(providerModels));
-        if (providerModels.length > 0) {
-          const allModels = store.getState().model.availableModels;
-          const preferredModel = allModels.find(
-            model => model.id === config.model.defaultModel
-              && (!config.model.defaultModelProvider || model.providerKey === config.model.defaultModelProvider)
-          ) ?? allModels[0];
-          dispatch(setDefaultSelectedModel(preferredModel));
-        }
-        mark('model resolution done');
-
-        const agreed = await window.electron.store.get('privacy_agreed');
-        setPrivacyAgreed(agreed === true);
-        mark('privacy check done');
-
-        setIsInitialized(true);
-        mark('shell ready');
-        if (!hasReportedAppStartedRef.current) {
-          hasReportedAppStartedRef.current = true;
-          void reportYdAnalyzer({
-            action: LogReporterAction.AppStarted,
-            providerModelCount: providerModels.length,
-            hasLoggedInUser: !!store.getState().auth.user?.yid,
-          });
-        }
-
-        void waitWithTimeout(scheduledTaskService.init(), 5000, 'scheduledTaskService.init').catch((error) => {
-          console.error('[App] initializeApp: scheduledTaskService.init failed:', error);
-        });
-
-      } catch (error) {
-        const elapsed = Math.round(performance.now() - t0);
-        const msg = error instanceof Error ? error.message : String(error);
-        const detail = `initializeApp FAILED after ${elapsed}ms: ${msg}`;
-        console.error(`[App] ${detail}`);
-        try { window.electron?.log?.fromRenderer?.('error', 'App', detail); } catch { /* best-effort */ }
-        setInitError(i18nService.t('initializationError'));
-        setIsInitialized(true);
-      }
-    };
-
-    void initializeApp();
-  }, [dispatch, waitWithTimeout]);
+  useEffect(() => () => {
+    if (initRetryTimerRef.current !== null) {
+      window.clearTimeout(initRetryTimerRef.current);
+    }
+  }, []);
 
   useEffect(() => {
     const unsubscribe = i18nService.subscribe(() => {
@@ -414,6 +642,14 @@ const App: React.FC = () => {
     setMainView('kits');
   }, []);
 
+  const handleSkillsConnectorsSectionChange = useCallback((section: SkillsConnectorsSection) => {
+    if (section === SkillsConnectorsSection.Connectors) {
+      handleShowMcp();
+    } else {
+      handleShowSkills();
+    }
+  }, [handleShowMcp, handleShowSkills]);
+
   const openHomeWithKit = useCallback((kitId: string, text?: string) => {
     dispatch(setActiveKitIds([kitId]));
     coworkService.clearSession({ restoreAgentSkills: true });
@@ -445,6 +681,19 @@ const App: React.FC = () => {
     openHomeWithKit(kitId);
   }, [openHomeWithKit]);
 
+  const handleSkillUse = useCallback((skillId: string) => {
+    dispatch(setActiveSkillIds([skillId]));
+    coworkService.clearSession({ restoreAgentSkills: true });
+    dispatch(clearSelection());
+    dispatch(setDraftSkillIds({ draftKey: '__home__', skillIds: [skillId] }));
+    setMainView('cowork');
+    window.setTimeout(() => {
+      window.dispatchEvent(new CustomEvent(CoworkUiEvent.FocusInput, {
+        detail: { clear: false },
+      }));
+    }, 0);
+  }, [dispatch]);
+
   const handleToggleSidebar = useCallback(() => {
     const nextCollapsed = !isSidebarCollapsed;
     const message = `sidebar toggle requested activeView=${mainView} nextCollapsed=${nextCollapsed} platform=${window.electron.platform}`;
@@ -462,6 +711,40 @@ const App: React.FC = () => {
       isCollapsed: isSidebarCollapsed,
     });
     setIsSidebarCollapsed((prev) => !prev);
+  }, [isSidebarCollapsed, mainView]);
+
+  const handleToggleTaskFilter = useCallback(() => {
+    const nextActive = !isTaskFilterActive;
+    const message = `task activity toggle requested activeView=${mainView} nextActive=${nextActive} hasUnreadCompleted=${hasUnreadCompletedTasks} platform=${window.electron.platform}`;
+    console.debug(`[TaskActivity] ${message}`);
+    try {
+      window.electron?.log?.fromRenderer?.('debug', 'TaskActivity', message);
+    } catch {
+      // Diagnostics must never block the sidebar interaction.
+    }
+    void reportYdAnalyzer({
+      action: LogReporterAction.SidebarAction,
+      source: 'home_sidebar',
+      actionType: 'task_filter_toggle',
+      activeView: mainView,
+      isCollapsed: isSidebarCollapsed,
+      targetSelected: nextActive,
+    });
+    setIsTaskFilterActive(nextActive);
+  }, [hasUnreadCompletedTasks, isSidebarCollapsed, isTaskFilterActive, mainView]);
+
+  const handleOpenTaskSearch = useCallback(() => {
+    void reportYdAnalyzer({
+      action: LogReporterAction.SidebarAction,
+      source: 'home_sidebar',
+      actionType: 'open_search',
+      activeView: mainView,
+      isCollapsed: isSidebarCollapsed,
+    });
+    window.dispatchEvent(new CustomEvent<CoworkTaskSearchRequestEventDetail>(
+      CoworkUiEvent.ShortcutSearch,
+      { detail: { source: CoworkTaskSearchRequestSource.WindowsTitleBar } },
+    ));
   }, [isSidebarCollapsed, mainView]);
 
   const handleNewChat = useCallback(() => {
@@ -512,15 +795,18 @@ const App: React.FC = () => {
     }, 0);
   }, [dispatch]);
 
-  const showToast = useCallback((message: string) => {
-    setToastMessage(message);
+  const showToast = useCallback((toast: string | ToastEventDetail) => {
+    const detail = typeof toast === 'string' ? { message: toast } : toast;
+    if (!detail.message) return;
+    setToastMessage(detail);
     if (toastTimerRef.current) {
       window.clearTimeout(toastTimerRef.current);
     }
+    // Toasts carrying an action button stay longer so the user can reach it.
     toastTimerRef.current = window.setTimeout(() => {
       setToastMessage(null);
       toastTimerRef.current = null;
-    }, 2200);
+    }, detail.actionLabel && detail.onAction ? 6000 : 2200);
   }, []);
 
   const startUserInitiatedUpdateFlow = useCallback((reason: string) => {
@@ -755,6 +1041,9 @@ const App: React.FC = () => {
   // Continuing from the welcome screen (login or custom model) counts as accepting the agreement.
   const acceptPrivacyAgreement = useCallback(async () => {
     await window.electron.store.set('privacy_agreed', true);
+    // Invalidate an earlier timed-out read before committing the user's newer
+    // consent so its late response cannot put the welcome gate back on screen.
+    invalidateLatestAsyncRequest(privacyGateRequestIdRef);
     setPrivacyAgreed(true);
   }, []);
 
@@ -864,9 +1153,18 @@ const App: React.FC = () => {
     return activeElement instanceof HTMLInputElement;
   };
 
+  const isCoworkSearchEligibleEditorActive = () => {
+    const activeElement = document.activeElement;
+    if (!(activeElement instanceof HTMLElement)) return false;
+    return Boolean(activeElement.closest([
+      '[data-skin-prompt-input="true"]',
+      '[data-cowork-conversation-search="true"]',
+    ].join(',')));
+  };
+
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.repeat || isShortcutInputActive() || isTextEditingActive()) return;
+      if (event.repeat || event.defaultPrevented || isShortcutInputActive()) return;
 
       const { shortcuts } = configService.getConfig();
       const activeShortcuts = {
@@ -874,7 +1172,13 @@ const App: React.FC = () => {
         ...(shortcuts ?? {}),
       };
 
-      const matchesAction = (action: ShortcutAction) => matchesShortcut(event, activeShortcuts[action]);
+      const isTextEditing = isTextEditingActive();
+      const matchesAction = (action: ShortcutAction) => {
+        const binding = activeShortcuts[action];
+        // While typing, only run shortcuts carrying a Cmd/Ctrl modifier so plain keys keep inserting text.
+        if (isTextEditing && !isTextEditingSafeShortcut(binding)) return false;
+        return matchesShortcut(event, binding);
+      };
 
       if (showSettings) {
         if (matchesAction(ShortcutAction.ShowShortcuts)) {
@@ -886,15 +1190,29 @@ const App: React.FC = () => {
 
       if (showUpdateModal || isPermissionModalOpen || isUpdateInteractionBlocked) return;
 
-      if (matchesAction(ShortcutAction.NewChat)) {
-        event.preventDefault();
-        handleNewChat();
+      if (matchesAction(ShortcutAction.Search)) {
+        const shortcutTarget = resolveConversationSearchShortcutTarget({
+          isCoworkView: mainView === 'cowork',
+          hasCurrentSession: Boolean(currentSessionId),
+          isTextEditing,
+          isCoworkSearchEligibleEditor: isCoworkSearchEligibleEditorActive(),
+        });
+        if (shortcutTarget === ConversationSearchShortcutTarget.Conversation) {
+          event.preventDefault();
+          window.dispatchEvent(new CustomEvent(CoworkUiEvent.ShortcutConversationSearch));
+        } else if (shortcutTarget === ConversationSearchShortcutTarget.History) {
+          event.preventDefault();
+          window.dispatchEvent(new CustomEvent<CoworkTaskSearchRequestEventDetail>(
+            CoworkUiEvent.ShortcutSearch,
+            { detail: { source: CoworkTaskSearchRequestSource.KeyboardShortcut } },
+          ));
+        }
         return;
       }
 
-      if (matchesAction(ShortcutAction.Search)) {
+      if (matchesAction(ShortcutAction.NewChat)) {
         event.preventDefault();
-        window.dispatchEvent(new CustomEvent(CoworkUiEvent.ShortcutSearch));
+        handleNewChat();
         return;
       }
 
@@ -981,6 +1299,14 @@ const App: React.FC = () => {
         return;
       }
 
+      if (matchesAction(ShortcutAction.CollapseCurrentAgentTasks)) {
+        event.preventDefault();
+        setMainView('cowork');
+        setIsSidebarCollapsed(false);
+        window.dispatchEvent(new CustomEvent(CoworkUiEvent.ShortcutCollapseCurrentAgentTasks));
+        return;
+      }
+
       const taskSlotIndex = AGENT_TASK_SLOT_SHORTCUT_ACTIONS.findIndex(action => matchesAction(action));
       if (taskSlotIndex >= 0) {
         event.preventDefault();
@@ -1052,8 +1378,8 @@ const App: React.FC = () => {
   // Listen for toast events from child components
   useEffect(() => {
     const handler = (e: Event) => {
-      const message = (e as CustomEvent<string>).detail;
-      if (message) showToast(message);
+      const detail = (e as CustomEvent<string | ToastEventDetail>).detail;
+      if (detail) showToast(detail);
     };
     window.addEventListener('app:showToast', handler);
     return () => window.removeEventListener('app:showToast', handler);
@@ -1260,8 +1586,17 @@ const App: React.FC = () => {
       isSidebarCollapsed={isSidebarCollapsed}
       sidebarWidth={sidebarWidth}
       onToggleSidebar={canUseWindowsTopBarActions ? handleToggleSidebar : undefined}
+      onSearch={canUseWindowsTopBarActions && !isSidebarCollapsed
+        ? handleOpenTaskSearch
+        : undefined}
       onNewChat={canUseWindowsCollapsedTopBarActions ? handleNewChat : undefined}
       sidebarToggleLabel={isSidebarCollapsed ? i18nService.t('expand') : i18nService.t('collapse')}
+      searchLabel={i18nService.t('search')}
+      showFilterIcon={SIDEBAR_TASK_FILTER_ENABLED && canUseWindowsTopBarActions && !isSidebarCollapsed && mainView === 'cowork'}
+      filterLabel={i18nService.t('sidebarFilter')}
+      isFilterActive={isTaskFilterActive}
+      hasFilterNotice={hasUnreadCompletedTasks}
+      onToggleFilter={handleToggleTaskFilter}
       newChatLabel={i18nService.t('newChat')}
       updateBadge={canUseWindowsCollapsedTopBarActions ? updateBadge : null}
     />
@@ -1290,19 +1625,27 @@ const App: React.FC = () => {
               <ChatBubbleLeftRightIcon className="h-8 w-8 text-white" />
             </div>
             <div className="text-foreground text-xl font-medium text-center">{initError}</div>
-            <div className="flex items-center gap-3">
+            <div className="flex flex-wrap items-center justify-center gap-3">
+              <button
+                onClick={handleInitRetry}
+                className="px-6 py-2.5 bg-primary hover:bg-primary-hover text-white rounded-xl transition-colors text-sm font-medium"
+              >
+                {i18nService.t('retry')}
+              </button>
               <button
                 onClick={() => window.electron.appInfo.relaunch()}
-                className="px-6 py-2.5 bg-primary hover:bg-primary-hover text-white rounded-xl transition-colors text-sm font-medium"
+                className="px-6 py-2.5 border border-border text-foreground hover:bg-surface-raised rounded-xl transition-colors text-sm font-medium"
               >
                 {i18nService.t('restartApp')}
               </button>
-              <button
-                onClick={() => handleShowSettings()}
-                className="px-6 py-2.5 border border-border text-foreground hover:bg-surface-raised rounded-xl transition-colors text-sm font-medium"
-              >
-                {i18nService.t('openSettings')}
-              </button>
+              {enterpriseConfigLoaded && privacyAgreed === true && (
+                <button
+                  onClick={() => handleShowSettings()}
+                  className="px-6 py-2.5 border border-border text-foreground hover:bg-surface-raised rounded-xl transition-colors text-sm font-medium"
+                >
+                  {i18nService.t('openSettings')}
+                </button>
+              )}
             </div>
           </div>
           {showSettings && (
@@ -1330,7 +1673,9 @@ const App: React.FC = () => {
       <div className="relative h-screen overflow-hidden">
         {toastMessage && (
           <Toast
-            message={toastMessage}
+            message={toastMessage.message}
+            actionLabel={toastMessage.actionLabel}
+            onAction={toastMessage.onAction}
             closeLabel={i18nService.t('close')}
             onClose={() => setToastMessage(null)}
           />
@@ -1359,7 +1704,9 @@ const App: React.FC = () => {
       >
       {toastMessage && (
         <Toast
-          message={toastMessage}
+          message={toastMessage.message}
+          actionLabel={toastMessage.actionLabel}
+          onAction={toastMessage.onAction}
           closeLabel={i18nService.t('close')}
           onClose={() => setToastMessage(null)}
         />
@@ -1367,7 +1714,7 @@ const App: React.FC = () => {
       {/* The welcome screen renders via the early return above, so agreement
           alone gates the campaign here (no separate showWelcome flag). */}
       <StartupCreditCampaign
-        enabled={privacyAgreed === true}
+        enabled={privacyAgreed === true && !isEnterpriseAccount}
       />
       {windowsStandaloneTitleBar}
       <div
@@ -1382,11 +1729,14 @@ const App: React.FC = () => {
           onShowCowork={handleShowCowork}
           onShowScheduledTasks={handleShowScheduledTasks}
           onShowKits={handleShowKits}
-          onShowMcp={handleShowMcp}
           onShowSites={handleShowSites}
           onNewChat={handleNewChat}
           isCollapsed={isSidebarCollapsed}
           onToggleCollapse={handleToggleSidebar}
+          isTaskFilterActive={isTaskFilterActive}
+          hasUnreadCompletedTasks={hasUnreadCompletedTasks}
+          onToggleTaskFilter={handleToggleTaskFilter}
+          onTaskFilterSummaryChange={setHasUnreadCompletedTasks}
           onWidthChange={setSidebarWidth}
           updateNotice={!isSidebarCollapsed && !isUpdateInteractionBlocked ? updateCard : null}
           hideAdBanner={isUpdateCardExpanded}
@@ -1403,14 +1753,17 @@ const App: React.FC = () => {
               <SkinBackdrop variant={SkinBackdropVariant.Management} />
             )}
             <EngineStartupOverlay />
-            {mainView === 'skills' ? (
-              <SkillsView
+            {mainView === 'skills' || mainView === 'mcp' ? (
+              <SkillsAndConnectorsView
+                activeSection={mainView === 'mcp' ? SkillsConnectorsSection.Connectors : SkillsConnectorsSection.Skills}
+                onSectionChange={handleSkillsConnectorsSectionChange}
                 isSidebarCollapsed={isSidebarCollapsed}
                 onToggleSidebar={handleToggleSidebar}
                 onNewChat={handleNewChat}
                 onCreateSkillByChat={handleCreateSkillByChat}
+                onUseSkill={handleSkillUse}
                 updateBadge={collapsedHeaderUpdateBadge}
-                readOnly={enterpriseConfig?.ui?.skills === 'readonly'}
+                skillsReadOnly={enterpriseConfig?.ui?.skills === 'readonly'}
               />
             ) : mainView === 'scheduledTasks' ? (
               <ScheduledTasksView
@@ -1427,13 +1780,6 @@ const App: React.FC = () => {
                 updateBadge={collapsedHeaderUpdateBadge}
                 onTryAsking={handleKitTryAsking}
                 onUseKit={handleKitUse}
-              />
-            ) : mainView === 'mcp' ? (
-              <McpView
-                isSidebarCollapsed={isSidebarCollapsed}
-                onToggleSidebar={handleToggleSidebar}
-                onNewChat={handleNewChat}
-                updateBadge={collapsedHeaderUpdateBadge}
               />
             ) : mainView === 'sites' ? (
               <SitesView
@@ -1506,4 +1852,4 @@ const App: React.FC = () => {
   );
 };
 
-export default App; 
+export default App;

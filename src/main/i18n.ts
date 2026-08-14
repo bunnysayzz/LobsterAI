@@ -69,6 +69,9 @@ const translations: Record<LanguageType, Record<string, string>> = {
       '积分额度已用完，请升级套餐后继续使用。[立即升级/充值](https://lobsterai.youdao.com/portal#/pricing)',
     coworkErrorFreeQuotaExhausted:
       '积分额度已用完，请升级套餐后继续使用。[立即升级/充值](https://lobsterai.youdao.com/portal#/pricing)',
+    coworkErrorEnterpriseMemberQuotaExhausted: '当前团队成员周期额度已用完。',
+    coworkErrorEnterprisePoolExhausted: '当前团队积分池已用完。',
+    coworkErrorEnterpriseCreditBatchesExpired: '当前团队积分批次已全部过期。',
     coworkErrorInsufficientBalance: 'API 余额不足，请充值后重试。',
     coworkErrorInputTooLong: '输入内容过长，超出模型上下文限制。',
     coworkErrorMessageTooLarge:
@@ -81,11 +84,16 @@ const translations: Record<LanguageType, Record<string, string>> = {
     coworkErrorGatewayDisconnected: 'AI 引擎连接中断，请重试。',
     coworkErrorServiceRestart: 'AI 引擎正在重启，请稍后重试。',
     coworkErrorGatewayDraining: 'AI 引擎正在重启中，请稍等片刻后重试。',
+    openClawConfigApplyPending: 'OpenClaw 正在应用配置，请稍后重试。',
+    openClawConfigApplyOverdue:
+      'OpenClaw 正在等待活动任务结束后应用配置。请完成或停止活动任务，然后重试。',
     coworkErrorModelResponseTimeout: '模型响应超时，请稍后重试。',
     coworkErrorNetworkError: '网络连接失败，请检查网络设置。',
     coworkErrorRateLimit: '请求过于频繁，请稍后再试。',
     coworkErrorModelOverloaded: '模型服务当前繁忙或容量不足，请稍后重试。',
     coworkErrorContentFiltered: '内容未通过安全审核，请修改后重试。',
+    coworkErrorToolLoopBlocked:
+      '检测到 AI 在重复执行同一个工具调用且没有新的进展（通常是在等待一个耗时较长的后台任务），本轮已被安全停止。后台任务可能仍在运行，可以继续发消息让 AI 接着处理。',
     coworkErrorServerError: '服务端出现错误，请稍后重试。',
     coworkErrorEngineNotReady: 'AI 引擎正在启动中，请稍等几秒后重试。',
     serverModelMetadataUnavailable: '套餐模型信息暂不可用，请刷新后重试。',
@@ -129,6 +137,14 @@ const translations: Record<LanguageType, Record<string, string>> = {
     // Auth quota
     authPlanFree: '免费',
     authPlanStandard: '标准',
+    enterpriseAccountContextMismatchTitle: '团队身份已失效',
+    enterpriseAccountContextMismatchMessage:
+      '当前团队身份与登录凭证不一致。相关图片和视频任务已停止轮询，请重新登录或重新选择团队身份后再试。',
+    enterpriseAccountContextMismatchConfirm: '知道了',
+    authAccountChanged: '登录账号已发生变化，请重试。',
+    authLoginRequired: '请先登录后再试。',
+    mediaTaskAccountMismatch: '该媒体任务属于其他账号，无法操作。',
+    enterpriseMediaQuotaUnavailable: '当前团队的媒体生成额度暂不可用。',
 
     // Data migration dialogs
     dataMigrationBackupDialogTitle: '备份 LobsterAI 数据',
@@ -391,6 +407,9 @@ const translations: Record<LanguageType, Record<string, string>> = {
       'Your credits have been used up. Upgrade your plan to continue.\n\n[Upgrade or recharge](https://lobsterai.youdao.com/portal#/pricing)',
     coworkErrorFreeQuotaExhausted:
       'Your credits have been used up. Upgrade your plan to continue.\n\n[Upgrade or recharge](https://lobsterai.youdao.com/portal#/pricing)',
+    coworkErrorEnterpriseMemberQuotaExhausted: 'The current team member period quota has been used up.',
+    coworkErrorEnterprisePoolExhausted: 'The current team credit pool has been used up.',
+    coworkErrorEnterpriseCreditBatchesExpired: 'All credit batches for the current team have expired.',
     coworkErrorInsufficientBalance: 'Insufficient API balance. Please top up and try again.',
     coworkErrorInputTooLong: 'Input too long, exceeding model context limit.',
     coworkErrorMessageTooLarge:
@@ -403,6 +422,9 @@ const translations: Record<LanguageType, Record<string, string>> = {
     coworkErrorGatewayDisconnected: 'AI engine connection lost. Please retry.',
     coworkErrorServiceRestart: 'AI engine is restarting. Please try again later.',
     coworkErrorGatewayDraining: 'AI engine is restarting. Please wait a moment and try again.',
+    openClawConfigApplyPending: 'OpenClaw is applying configuration. Please try again shortly.',
+    openClawConfigApplyOverdue:
+      'OpenClaw is waiting for active tasks to finish before applying configuration. Complete or stop the active tasks, then try again.',
     coworkErrorModelResponseTimeout: 'The model response timed out. Please try again.',
     coworkErrorNetworkError: 'Network connection failed. Please check your network settings.',
     coworkErrorRateLimit: 'Too many requests. Please try again later.',
@@ -410,6 +432,8 @@ const translations: Record<LanguageType, Record<string, string>> = {
       'The model service is temporarily busy or at capacity. Please try again later.',
     coworkErrorContentFiltered:
       'Content did not pass the safety review. Please modify and try again.',
+    coworkErrorToolLoopBlocked:
+      'This turn was stopped safely because the AI kept repeating the same tool call with no new progress (usually while waiting on a slow background task). The background task may still be running — send another message to continue.',
     coworkErrorServerError: 'Server error occurred. Please try again later.',
     coworkErrorEngineNotReady: 'AI engine is starting up. Please wait a few seconds and try again.',
     serverModelMetadataUnavailable:
@@ -459,6 +483,14 @@ const translations: Record<LanguageType, Record<string, string>> = {
     // Auth quota
     authPlanFree: 'Free',
     authPlanStandard: 'Standard',
+    enterpriseAccountContextMismatchTitle: 'Team identity expired',
+    enterpriseAccountContextMismatchMessage:
+      'Your team identity no longer matches the login credentials. Related image and video polling has stopped. Sign in again or choose a team identity before retrying.',
+    enterpriseAccountContextMismatchConfirm: 'OK',
+    authAccountChanged: 'The signed-in account changed. Try again.',
+    authLoginRequired: 'Sign in and try again.',
+    mediaTaskAccountMismatch: 'This media task belongs to another account.',
+    enterpriseMediaQuotaUnavailable: 'Media generation quota is unavailable for this team.',
 
     // Data migration dialogs
     dataMigrationBackupDialogTitle: 'Back Up LobsterAI Data',

@@ -33,10 +33,16 @@ import {
 import {
   AgentId,
 } from '../shared/agent/constants';
+import {
+  LogReporterAction,
+  LogReporterSource,
+  LogReporterStoreKey,
+} from '../shared/analytics/constants';
 import { AppIpcChannel } from '../shared/app/constants';
 import { AppSettingsAutoLaunchErrorCode, AppSettingsIpc } from '../shared/appSettings/constants';
 import { AppUpdateIpc } from '../shared/appUpdate/constants';
 import { ArtifactBrowserPartition, ArtifactPreviewIpc, ArtifactPreviewProtocol } from '../shared/artifactPreview/constants';
+import { createAccountOwnerKey } from '../shared/auth/accountOwner';
 import {
   AuthIpcChannel,
   type AuthLifecycleEvent,
@@ -74,6 +80,8 @@ import {
 } from '../shared/cowork/btw';
 import {
   COWORK_MESSAGE_PAGE_SIZE,
+  COWORK_SEARCH_MESSAGE_PAGE_MAX_SIZE,
+  COWORK_SEARCH_MESSAGE_PAGE_SIZE,
   COWORK_SESSION_PAGE_SIZE,
   COWORK_TEMP_ATTACHMENTS_DIR_NAME,
   COWORK_TEMP_DIR_NAME,
@@ -89,6 +97,7 @@ import {
   validateCoworkImageAttachmentSize,
 } from '../shared/cowork/imageAttachments';
 import { containsPlanModePrompt } from '../shared/cowork/planMode';
+import type { CoworkSearchMessageCursor } from '../shared/cowork/search';
 import {
   type CoworkSelectedTextSnippet,
   normalizeCoworkSelectedTextSnippets,
@@ -104,6 +113,13 @@ import {
   DataMigrationRestoreStatus,
 } from '../shared/dataMigration/constants';
 import { DialogIpc } from '../shared/dialog/constants';
+import {
+  EnterpriseAccountIpcChannel,
+  EnterpriseAccountMode,
+  EnterpriseApiErrorCode,
+  EnterpriseQuotaMessageMetadataKey,
+} from '../shared/enterpriseAccount/constants';
+import { resolveEnterpriseQuotaError } from '../shared/enterpriseAccount/quotaError';
 import {
   HtmlShareAccessMode,
   type HtmlShareAccessMode as HtmlShareAccessModeValue,
@@ -139,6 +155,7 @@ import { PlatformRegistry } from '../shared/platform';
 import {
   ModelRuntimeProfile,
   OpenClawProviderId,
+  parseModelThinkingLevel,
   ProviderName,
 } from '../shared/providers';
 import {
@@ -166,6 +183,24 @@ import { authQuotaGateStateFromQuota, AuthSubscriptionStatus, createDefaultAuthQ
 import { type AutoLaunchStatus, getAutoLaunchStatus, isAutoLaunched, setAutoLaunchEnabled } from './autoLaunchManager';
 import { getRecentComputerUseLogEntries } from './computerUse/computerUseLogs';
 import { type CoworkForkContextMessage, type CoworkMessage, CoworkStore } from './coworkStore';
+import {
+  buildEnterpriseAccountRequestHeaders,
+  clearEnterpriseAccountContext,
+  fetchEnterpriseAccountContext,
+  fetchEnterpriseAccountIdentities,
+  getPersistedEnterpriseAccountContext,
+  normalizeEnterpriseAccountContext,
+  persistEnterpriseAccountContext,
+  readAccountMode,
+  requestEnterpriseQuotaIncrease,
+} from './enterpriseAccount/context';
+import {
+  createEnterpriseAuthSessionSnapshot,
+  createEnterpriseMembershipRevocationHandler,
+  EnterpriseMembershipRevocationSource,
+  readEnterpriseApiErrorCode,
+  resolveEnterpriseMembershipRevocationSource,
+} from './enterpriseAccount/membershipRevocation';
 import { setLanguage, t } from './i18n';
 import { IMGatewayConfig, IMGatewayManager } from './im';
 import {
@@ -190,6 +225,7 @@ import { registerActivityIpcHandlers } from './ipcHandlers/activity';
 import { registerAgentHandlers } from './ipcHandlers/agents';
 import { registerAsrIpcHandlers } from './ipcHandlers/asr';
 import { registerCoworkSubagentHandlers } from './ipcHandlers/coworkSubagent';
+import { registerEnterpriseAccountHandlers } from './ipcHandlers/enterpriseAccount';
 import { registerKitHandlers } from './ipcHandlers/kits';
 import { registerMcpHandlers } from './ipcHandlers/mcp';
 import { registerNimQrLoginHandlers } from './ipcHandlers/nimQrLogin';
@@ -262,6 +298,7 @@ import {
 } from './libs/coworkTempJanitor';
 import {
   generateSessionTitle,
+  getElectronNodeRuntimePath,
   probeCoworkModelReadiness,
 } from './libs/coworkUtil';
 import {
@@ -309,6 +346,7 @@ import {
 import { packageHtmlFile } from './libs/htmlShare/htmlSharePackager';
 import { getKeyfromAttribution, initializeKeyfromAttribution } from './libs/keyfromAttribution';
 import { exportLogsZip } from './libs/logExport';
+import { MainLogReporter } from './libs/mainLogReporter';
 import { inferImageMimeTypeFromDataUrl, type PersistedGeneratedImageAsset, persistGeneratedImageAssets, type PersistGeneratedImageAssetsResult, persistGeneratedVideoAssets, type RemoteGeneratedMediaAsset } from './libs/mediaAssetPersistence';
 import {
   migrateAgentModelRefs,
@@ -324,7 +362,11 @@ import {
   DEFAULT_MANAGED_AGENT_ID,
   OpenClawChannelSessionSync,
 } from './libs/openclawChannelSessionSync';
-import { deliverOpenClawConfigToGateway } from './libs/openclawConfigDelivery';
+import {
+  CONFIG_DELIVERY_FALLBACK_REASON_PREFIX,
+  deliverOpenClawConfigToGateway,
+  OpenClawConfigDeliveryMode,
+} from './libs/openclawConfigDelivery';
 import {
   classifyAppConfigChange,
   classifyCoworkConfigChange,
@@ -359,6 +401,10 @@ import {
   writeBootstrapFile,
   writeMemoryFileRaw,
 } from './libs/openclawMemoryFile';
+import {
+  migrateLegacyOpenClawPluginInstalls,
+  OpenClawPluginInstallMigrationStatus,
+} from './libs/openclawPluginInstallMigration';
 import { collectReferencedEnvVarNames, pickReferencedSecretEnvVars } from './libs/openclawSecretEnv';
 import { startOpenClawTokenProxy, stopOpenClawTokenProxy } from './libs/openclawTokenProxy';
 import { migrateMainAgentWorkspace } from './libs/openclawWorkspaceMigration';
@@ -399,6 +445,24 @@ import {
 } from './libs/systemProxy';
 import { getLogFilePath, getRecentMainLogEntries, initLogger } from './logger';
 import { type AskUserResponse, McpRuntime } from './mcp/mcpRuntime';
+import {
+  type AccountBoundValue,
+  type AuthExchangeIntentSnapshot,
+  type AuthStateSnapshot,
+  bindAccountValue,
+  canAccessTrackedMediaTask,
+  clearMediaTaskOwnerAliasesForOwner,
+  createAccountScopedFetch,
+  isAuthExchangeIntentCurrent,
+  isAuthStateSnapshotCurrent,
+  isMediaAccountScopeCurrent,
+  isMediaAccountScopeSnapshotCurrent,
+  type MediaAccountScope,
+  rebindMediaAccountScope,
+  rememberMediaTaskOwnerAliases,
+  resolveAccountBoundValue,
+  shouldRemoveMediaTaskAfterPoll,
+} from './mediaAccountIsolation';
 import {
   MediaGenerationGateReason,
   MediaGenerationTool,
@@ -1301,7 +1365,12 @@ function sanitizeOpenClawSessionPatch(input: unknown): OpenClawSessionPatch {
   if (model !== undefined) patch.model = model;
 
   const thinkingLevel = sanitizeOptionalPatchValue(source.thinkingLevel);
-  if (thinkingLevel !== undefined) patch.thinkingLevel = thinkingLevel;
+  if (thinkingLevel !== undefined) {
+    if (thinkingLevel !== null && thinkingLevel !== '' && !parseModelThinkingLevel(thinkingLevel)) {
+      throw new Error('Unsupported session thinking level.');
+    }
+    patch.thinkingLevel = thinkingLevel;
+  }
 
   const reasoningLevel = sanitizeOptionalPatchValue(source.reasoningLevel);
   if (reasoningLevel !== undefined) patch.reasoningLevel = reasoningLevel;
@@ -1567,10 +1636,21 @@ const sanitizeCoworkMessageForIpc = (message: unknown): unknown => {
 
   // Preserve image metadata as-is; previews are already size-bounded, while
   // legacy imageAttachments may contain historical base64 payloads.
+  // Browser annotations nest deeper than IPC_MAX_DEPTH (screenshot/anchor sit
+  // at depth 5), so re-normalize them instead of generic depth truncation;
+  // normalizeBrowserAnnotationBatches enforces its own count/length bounds.
   let sanitizedMetadata: unknown;
   if (messageRecord.metadata && typeof messageRecord.metadata === 'object') {
-    const { imageAttachments, imageAttachmentPreviews, ...rest } = messageRecord.metadata as Record<string, unknown>;
+    const {
+      imageAttachments,
+      imageAttachmentPreviews,
+      browserAnnotations,
+      ...rest
+    } = messageRecord.metadata as Record<string, unknown>;
     const sanitizedRest = sanitizeIpcPayload(rest) as Record<string, unknown> | undefined;
+    const sanitizedBrowserAnnotations = Array.isArray(browserAnnotations) && browserAnnotations.length > 0
+      ? normalizeBrowserAnnotationBatches(browserAnnotations)
+      : [];
     sanitizedMetadata = {
       ...(sanitizedRest && typeof sanitizedRest === 'object' ? sanitizedRest : {}),
       ...(Array.isArray(imageAttachments) && imageAttachments.length > 0
@@ -1578,6 +1658,9 @@ const sanitizeCoworkMessageForIpc = (message: unknown): unknown => {
         : {}),
       ...(Array.isArray(imageAttachmentPreviews) && imageAttachmentPreviews.length > 0
         ? { imageAttachmentPreviews }
+        : {}),
+      ...(sanitizedBrowserAnnotations.length > 0
+        ? { browserAnnotations: sanitizedBrowserAnnotations }
         : {}),
     };
   } else {
@@ -1650,6 +1733,15 @@ const savePngWithDialog = async (
   defaultFileName?: string,
 ): Promise<{ success: boolean; canceled?: boolean; path?: string; error?: string }> => {
   const defaultName = getDefaultExportImageName(defaultFileName);
+  // Automation hook: end-to-end tests cannot drive the native save dialog, so
+  // an explicit directory override saves the PNG directly.
+  const autosaveDir = process.env.LOBSTERAI_EXPORT_IMAGE_AUTOSAVE_DIR;
+  if (autosaveDir) {
+    const outputPath = ensurePngFileName(path.join(autosaveDir, defaultName));
+    await fs.promises.mkdir(autosaveDir, { recursive: true });
+    await fs.promises.writeFile(outputPath, pngData);
+    return { success: true, canceled: false, path: outputPath };
+  }
   const ownerWindow = BrowserWindow.fromWebContents(webContents);
   const saveOptions = {
     title: 'Export Session Image',
@@ -1842,8 +1934,7 @@ let coworkRuntimeForwarderBound = false;
 let memoryMigrationDone = false;
 let preventSleepBlockerId: number | null = null;
 let appUpdateCoordinator: AppUpdateCoordinator | null = null;
-
-const AUTH_USER_STORE_KEY = 'auth_user';
+let mainLogReporter: MainLogReporter | null = null;
 
 function setPreventSleepBlockerEnabled(enabled: boolean): void {
   if (enabled) {
@@ -1909,6 +2000,22 @@ const getAppUpdateCoordinator = (): AppUpdateCoordinator => {
     appUpdateCoordinator = new AppUpdateCoordinator(getStore());
   }
   return appUpdateCoordinator;
+};
+
+const getMainLogReporter = (): MainLogReporter => {
+  if (!mainLogReporter) {
+    mainLogReporter = new MainLogReporter({
+      appVersion: app.getVersion(),
+      fetch: async (url, signal) => {
+        const response = await session.defaultSession.fetch(url, { method: 'GET', signal });
+        const result = { ok: response.ok, status: response.status };
+        await response.body?.cancel();
+        return result;
+      },
+      store: getStore(),
+    });
+  }
+  return mainLogReporter;
 };
 
 const forwardOpenClawStatus = (status: OpenClawEngineStatus): void => {
@@ -2140,7 +2247,7 @@ const getOpenClawConfigSync = (): OpenClawConfigSync => {
       getSkillsList: () =>
         getSkillManager()
           .listSkills()
-          .map(s => ({ id: s.id, enabled: s.enabled })),
+          .map(s => ({ id: s.id, name: s.name, enabled: s.enabled })),
       getTelegramInstances: () => {
         try {
           return getIMGatewayManager().getIMStore().getTelegramInstances();
@@ -2246,13 +2353,15 @@ const getOpenClawConfigSync = (): OpenClawConfigSync => {
 };
 
 // Deferred gateway restart: when a config change requires a gateway restart
-// but active cowork sessions or cron jobs exist, we defer the restart until
-// all workloads complete.  A polling interval checks periodically; a hard
-// timeout ensures the restart eventually happens even if a session hangs.
+// but active cowork sessions or cron jobs exist, defer it until all workloads
+// complete. Polling applies it at the first idle point; after the overdue
+// threshold we keep the same request queued and surface a clearer pending
+// state instead of repeatedly re-syncing or terminating in-flight work.
 let deferredRestartTimer: ReturnType<typeof setInterval> | null = null;
 let deferredRestartTimeout: ReturnType<typeof setTimeout> | null = null;
+let deferredRestartOverdue = false;
 const DEFERRED_RESTART_POLL_MS = 3_000;
-const DEFERRED_RESTART_MAX_WAIT_MS = 5 * 60_000; // 5 minutes hard cap
+const DEFERRED_RESTART_OVERDUE_MS = 5 * 60_000;
 
 const hasActiveGatewayWorkloads = (): boolean => {
   if (openClawRuntimeAdapter?.hasActiveSessions()) return true;
@@ -2273,6 +2382,7 @@ const clearDeferredRestart = () => {
     clearTimeout(deferredRestartTimeout);
     deferredRestartTimeout = null;
   }
+  deferredRestartOverdue = false;
 };
 
 type SyncOpenClawConfigOptions = {
@@ -2331,12 +2441,16 @@ const waitForOpenClawConfigApply = async (context: string): Promise<OpenClawEngi
 
   if (deferredRestartReason) {
     return buildConfigApplyPendingStatus(
-      'OpenClaw is applying MCP configuration. Please try again shortly.',
+      deferredRestartOverdue
+        ? t('openClawConfigApplyOverdue')
+        : t('openClawConfigApplyPending'),
     );
   }
 
   return null;
 };
+
+const DEFERRED_SYNC_REASON_PREFIX = 'deferred:';
 
 const executeDeferredGatewayRestart = async (reason: string) => {
   clearDeferredRestart();
@@ -2344,11 +2458,52 @@ const executeDeferredGatewayRestart = async (reason: string) => {
   console.log(
     `${gwDiagTs()} executeDeferredGatewayRestart: performing deferred restart (reason: ${reason})`,
   );
+  // When the sync below re-defers (workloads still active), the re-scheduled
+  // reason flows back here on the next attempt — don't stack another
+  // `deferred:` prefix. Unbounded stacking also breaks the
+  // selfRestartSatisfiesSync() prefix check, misclassifying restarts that a
+  // gateway self-restart would satisfy as needing a full respawn.
+  const syncReason = reason.startsWith(DEFERRED_SYNC_REASON_PREFIX)
+    ? reason
+    : `${DEFERRED_SYNC_REASON_PREFIX}${reason}`;
   await syncOpenClawConfig({
-    reason: `deferred:${reason}`,
+    reason: syncReason,
     restartGatewayIfRunning: true,
     expectedImpact: OpenClawConfigImpact.Restart,
   });
+};
+
+// A hard restart requested while the gateway is restarting itself (config
+// reload → SIGUSR1) is parked here instead of killing the mid-restart process.
+// When the gateway client reconnects we either drop it (the self-restart
+// already loaded the on-disk config) or replay it (env vars need a respawn).
+type PendingSelfRestartReevaluation = {
+  reasons: string[];
+  requiresRespawn: boolean;
+  gatewayPid: number | null;
+};
+let pendingSelfRestartReevaluation: PendingSelfRestartReevaluation | null = null;
+
+/**
+ * True when this sync's restart demand is satisfied by the gateway reloading
+ * the on-disk config (which a self-restart does). Env-var changes need a
+ * respawn (same-process restart keeps the old environment), and explicit
+ * restart flags may depend on out-of-config state — except the
+ * config-delivery fallback, whose only goal is on-disk config convergence.
+ */
+const selfRestartSatisfiesSync = (
+  options: SyncOpenClawConfigOptions,
+  secretEnvVarsChanged: boolean,
+): boolean => {
+  if (secretEnvVarsChanged) {
+    return false;
+  }
+  if (options.restartGatewayIfRunning === true) {
+    return options.reason.startsWith(
+      `${DEFERRED_SYNC_REASON_PREFIX}${CONFIG_DELIVERY_FALLBACK_REASON_PREFIX}`,
+    );
+  }
+  return true;
 };
 
 const scheduleDeferredGatewayRestart = (reason: string) => {
@@ -2362,22 +2517,33 @@ const scheduleDeferredGatewayRestart = (reason: string) => {
   }
 
   console.log(
-    `${gwDiagTs()} scheduleDeferredGatewayRestart: scheduling deferred restart, polling every ${DEFERRED_RESTART_POLL_MS}ms, max wait ${DEFERRED_RESTART_MAX_WAIT_MS}ms (reason: ${reason})`,
+    `${gwDiagTs()} scheduleDeferredGatewayRestart: scheduling deferred restart, polling every ${DEFERRED_RESTART_POLL_MS}ms, overdue threshold ${DEFERRED_RESTART_OVERDUE_MS}ms (reason: ${reason})`,
   );
   deferredRestartReason = reason;
+  deferredRestartOverdue = false;
   deferredRestartTimer = setInterval(() => {
     if (!hasActiveGatewayWorkloads()) {
       void executeDeferredGatewayRestart(reason);
     }
   }, DEFERRED_RESTART_POLL_MS);
 
-  // Hard timeout: restart anyway after max wait to avoid config drift.
+  // Do not kill an active task at the threshold. Keep the original interval
+  // alive so the restart happens at the first idle poll, and avoid re-running
+  // sync every five minutes while a long task is still active.
   deferredRestartTimeout = setTimeout(() => {
+    deferredRestartTimeout = null;
+    if (hasActiveGatewayWorkloads()) {
+      deferredRestartOverdue = true;
+      console.warn(
+        `${gwDiagTs()} scheduleDeferredGatewayRestart: overdue while workloads remain active; restart stays queued until the first idle poll (reason: ${reason})`,
+      );
+      return;
+    }
     console.warn(
-      `${gwDiagTs()} scheduleDeferredGatewayRestart: max wait exceeded, forcing restart (reason: ${reason})`,
+      `${gwDiagTs()} scheduleDeferredGatewayRestart: overdue threshold reached after workloads drained; applying queued restart (reason: ${reason})`,
     );
     void executeDeferredGatewayRestart(reason);
-  }, DEFERRED_RESTART_MAX_WAIT_MS);
+  }, DEFERRED_RESTART_OVERDUE_MS);
 };
 
 const _syncOpenClawConfigImpl = async (
@@ -2388,6 +2554,34 @@ const _syncOpenClawConfigImpl = async (
     `${D()} ──── syncOpenClawConfig START reason=${options.reason} restartIfRunning=${!!options.restartGatewayIfRunning} expectedImpact=${options.expectedImpact ?? OpenClawConfigImpact.None}`,
   );
 
+  const configSync = getOpenClawConfigSync();
+  const manager = getOpenClawEngineManager();
+  const migrationSecretEnvVars = {
+    ...manager.getSecretEnvVars(),
+    ...configSync.collectSecretEnvVars(),
+  };
+  const pluginInstallMigration = await migrateLegacyOpenClawPluginInstalls({
+    configPath: manager.getConfigPath(),
+    stateDir: manager.getStateDir(),
+    runtimeRoot: manager.getRuntimeRoot(),
+    electronNodeRuntimePath: getElectronNodeRuntimePath(),
+    env: process.env,
+    secretEnvVars: migrationSecretEnvVars,
+  });
+  if (pluginInstallMigration.status === OpenClawPluginInstallMigrationStatus.Failed) {
+    const message = `OpenClaw legacy plugin install migration failed: ${pluginInstallMigration.error}`;
+    console.error('[OpenClaw] Legacy plugin install migration blocked config sync:', new Error(message));
+    const status = manager.setExternalError(message);
+    return {
+      success: false,
+      changed: false,
+      status,
+      error: message,
+    };
+  }
+  const pluginInstallMigrationChanged =
+    pluginInstallMigration.status === OpenClawPluginInstallMigrationStatus.Migrated;
+
   // Resolve MCP servers before sync (async → cache for synchronous callback)
   try {
     await getMcpRuntime().refreshResolvedServersCache();
@@ -2396,7 +2590,7 @@ const _syncOpenClawConfigImpl = async (
     getMcpRuntime().clearResolvedServersCache();
   }
 
-  const syncResult = getOpenClawConfigSync().sync(options.reason);
+  const syncResult = configSync.sync(options.reason);
   console.log(
     `${D()} sync() ok=${syncResult.ok} changed=${syncResult.changed} bindingsChanged=${!!syncResult.bindingsChanged} restartImpact=${syncResult.restartImpact ?? OpenClawConfigImpact.None}`,
   );
@@ -2413,17 +2607,24 @@ const _syncOpenClawConfigImpl = async (
     };
   }
 
+  let enterpriseConfigChanged = false;
   try {
-    mergeEnterpriseOpenclawConfig(getOpenClawEngineManager().getConfigPath());
+    enterpriseConfigChanged = mergeEnterpriseOpenclawConfig(manager.getConfigPath());
   } catch {
     /* non-critical */
   }
 
-  const nextSecretEnvVars = getOpenClawConfigSync().collectSecretEnvVars();
-  const prevSecretEnvVars = getOpenClawEngineManager().getSecretEnvVars();
+  const effectiveConfigChanged =
+    syncResult.changed || pluginInstallMigrationChanged || enterpriseConfigChanged;
+  console.log(
+    `${D()} final config changed=${effectiveConfigChanged} (sync=${syncResult.changed} legacyMigration=${pluginInstallMigrationChanged} enterprise=${enterpriseConfigChanged})`,
+  );
+
+  const nextSecretEnvVars = configSync.collectSecretEnvVars();
+  const prevSecretEnvVars = manager.getSecretEnvVars();
   let referencedSecretEnvVarNames: Set<string> | null = null;
   try {
-    const configText = fs.readFileSync(getOpenClawEngineManager().getConfigPath(), 'utf8');
+    const configText = fs.readFileSync(manager.getConfigPath(), 'utf8');
     referencedSecretEnvVarNames = collectReferencedEnvVarNames(configText);
   } catch (error) {
     console.warn('[OpenClawConfigSync] failed to inspect referenced secret env vars, comparing all secrets:', error);
@@ -2435,7 +2636,7 @@ const _syncOpenClawConfigImpl = async (
     ? pickReferencedSecretEnvVars(prevSecretEnvVars, referencedSecretEnvVarNames)
     : prevSecretEnvVars;
   const secretEnvVarsChanged = JSON.stringify(effectiveNextSecretEnvVars) !== JSON.stringify(effectivePrevSecretEnvVars);
-  getOpenClawEngineManager().setSecretEnvVars(nextSecretEnvVars);
+  manager.setSecretEnvVars(nextSecretEnvVars);
 
   // Diagnostic: print which env vars changed
   if (secretEnvVarsChanged) {
@@ -2467,7 +2668,7 @@ const _syncOpenClawConfigImpl = async (
   // requires a running gateway restart. Some IM account state changes are stored
   // outside openclaw.json, so the explicit flag must not depend on config diffing.
   const expectedRestartImpact =
-    syncResult.changed
+    effectiveConfigChanged
     && options.expectedImpact === OpenClawConfigImpact.Restart;
   const syncRestartImpact =
     syncResult.restartImpact === OpenClawConfigImpact.Restart;
@@ -2479,11 +2680,11 @@ const _syncOpenClawConfigImpl = async (
     options.restartGatewayIfRunning === true;
 
   console.log(
-    `${D()} needsHardRestart=${needsHardRestart} (envChanged=${secretEnvVarsChanged} bindingsChanged=${!!syncResult.bindingsChanged} configChanged=${syncResult.changed} restartImpact=${syncResult.restartImpact ?? OpenClawConfigImpact.None} expectedRestart=${expectedRestartImpact} restartFlag=${!!options.restartGatewayIfRunning})`,
+    `${D()} needsHardRestart=${needsHardRestart} (envChanged=${secretEnvVarsChanged} bindingsChanged=${!!syncResult.bindingsChanged} configChanged=${effectiveConfigChanged} restartImpact=${syncResult.restartImpact ?? OpenClawConfigImpact.None} expectedRestart=${expectedRestartImpact} restartFlag=${!!options.restartGatewayIfRunning})`,
   );
 
   if (!needsHardRestart) {
-    if (!syncResult.changed) {
+    if (!effectiveConfigChanged) {
       console.log(`${D()} ──── NO RESTART, config unchanged. reason=${options.reason}`);
       return {
         success: true,
@@ -2507,13 +2708,20 @@ const _syncOpenClawConfigImpl = async (
     console.log(
       `${D()} ──── NO RESTART, hot delivery mode=${delivery.mode} restartScheduled=${delivery.restartScheduled}. reason=${options.reason}`,
     );
+    if (delivery.mode === OpenClawConfigDeliveryMode.Rejected) {
+      return {
+        success: false,
+        changed: true,
+        status: deliveryManager.getStatus(),
+        error: delivery.detail,
+      };
+    }
     return {
       success: true,
       changed: true,
     };
   }
 
-  const manager = getOpenClawEngineManager();
   const status = manager.getStatus();
   if (status.phase !== 'running') {
     console.log(
@@ -2529,6 +2737,26 @@ const _syncOpenClawConfigImpl = async (
   if (hasActiveGatewayWorkloads()) {
     console.log(`${D()} ──── RESTART DEFERRED (active workloads). reason=${options.reason}`);
     scheduleDeferredGatewayRestart(options.reason);
+    return {
+      success: true,
+      changed: true,
+      status,
+    };
+  }
+
+  if (manager.isGatewaySelfRestartActive()) {
+    // Killing the gateway mid self-restart poisons its single-instance lock
+    // (empty lock file → 30s of "gateway already running; lock timeout").
+    // Park the demand; the gateway-ready callback re-evaluates it.
+    const requiresRespawn = !selfRestartSatisfiesSync(options, secretEnvVarsChanged);
+    pendingSelfRestartReevaluation = {
+      reasons: [...(pendingSelfRestartReevaluation?.reasons ?? []), options.reason],
+      requiresRespawn: (pendingSelfRestartReevaluation?.requiresRespawn ?? false) || requiresRespawn,
+      gatewayPid: pendingSelfRestartReevaluation?.gatewayPid ?? manager.getGatewayProcessPid(),
+    };
+    console.log(
+      `${D()} ──── RESTART PARKED (gateway self-restart in progress). reason=${options.reason}, requiresRespawn=${requiresRespawn}`,
+    );
     return {
       success: true,
       changed: true,
@@ -2603,6 +2831,35 @@ const syncOpenClawConfig = async (
       openClawConfigApplyState = null;
     }
   }
+};
+
+// The gateway client reconnected — any self-restart has settled. Resolve the
+// parked restart demand: a same-pid (in-process) restart already loaded the
+// on-disk config, so only env-var style demands still need a real respawn.
+// A changed pid means the process was respawned with fresh env anyway.
+const handleGatewaySelfRestartSettled = () => {
+  const manager = getOpenClawEngineManager();
+  manager.clearGatewaySelfRestart();
+  const pending = pendingSelfRestartReevaluation;
+  if (!pending) {
+    return;
+  }
+  pendingSelfRestartReevaluation = null;
+  const currentPid = manager.getGatewayProcessPid();
+  const respawned = pending.gatewayPid != null && currentPid != null && currentPid !== pending.gatewayPid;
+  if (pending.requiresRespawn && !respawned) {
+    console.log(
+      `${gwDiagTs()} parked restart still required after gateway self-restart (reasons: ${pending.reasons.join(', ')}); executing now`,
+    );
+    void syncOpenClawConfig({
+      reason: `self-restart-reevaluate:${pending.reasons[0]}`,
+      restartGatewayIfRunning: true,
+    });
+    return;
+  }
+  console.log(
+    `${gwDiagTs()} parked restart satisfied by gateway self-restart (reasons: ${pending.reasons.join(', ')}, respawned=${respawned})`,
+  );
 };
 
 type OpenClawGatewayRepairResult = {
@@ -2895,6 +3152,7 @@ const bindCoworkRuntimeForwarder = (): void => {
 
   runtime.on('complete', (sessionId: string, claudeSessionId: string | null) => {
     mediaSelectionBySession.delete(sessionId);
+    mediaTurnAccountScopeBySession.delete(sessionId);
     skinRuntimeController?.handleRuntimeComplete(sessionId);
     mediaReferencesBySession.delete(sessionId);
     getDesktopNotificationManager().handleComplete(sessionId);
@@ -2919,6 +3177,7 @@ const bindCoworkRuntimeForwarder = (): void => {
 
   runtime.on('error', (sessionId: string, error: string) => {
     mediaSelectionBySession.delete(sessionId);
+    mediaTurnAccountScopeBySession.delete(sessionId);
     skinRuntimeController?.handleRuntimeError(sessionId);
     mediaReferencesBySession.delete(sessionId);
     // Mark session as error in store so the .catch() fallback can detect duplicates.
@@ -2932,6 +3191,17 @@ const bindCoworkRuntimeForwarder = (): void => {
       if (win.isDestroyed()) return;
       win.webContents.send('cowork:stream:error', { sessionId, error });
     });
+    try {
+      if (shouldRefreshServerQuotaForSession(sessionId)) {
+        windows.forEach(win => {
+          if (!win.isDestroyed()) {
+            win.webContents.send('auth:quotaChanged');
+          }
+        });
+      }
+    } catch {
+      // Quota refresh is best-effort after a runtime error.
+    }
   });
 
   coworkRuntimeForwarderBound = true;
@@ -2945,7 +3215,17 @@ const getCoworkEngineRouter = () => {
         getOpenClawEngineManager(),
         {
           normalizeModelRef: normalizeOpenClawModelRef,
-          onGatewayClientReady: () => getCronJobService().notifyGatewayReady(),
+          onChannelPromptSubmit: event => {
+            void getMainLogReporter().report({
+              action: LogReporterAction.ImPromptSubmit,
+              source: LogReporterSource.OpenClawChannel,
+              ...event,
+            });
+          },
+          onGatewayClientReady: () => {
+            getCronJobService().notifyGatewayReady();
+            handleGatewaySelfRestartSettled();
+          },
         },
         new SubagentRunStore(getStore().getDatabase()),
         new SubagentMessageStore(getStore().getDatabase()),
@@ -3497,8 +3777,10 @@ const hideMainWindowForClose = (win: BrowserWindow): void => {
 // 存储活跃的流式请求控制器
 const activeStreamControllers = new Map<string, AbortController>();
 
-// Media generation selection per session (for turn-level tool gating)
-const mediaSelectionBySession = new Map<string, MediaSelectionState>();
+// Media generation selection and authenticated owner per session turn.
+const mediaSelectionBySession = new Map<string, AccountBoundValue<MediaSelectionState>>();
+const mediaTurnAccountScopeBySession = new Map<string, MediaAccountScope>();
+let resolveCurrentMediaAccountScope = (): MediaAccountScope | null => null;
 
 // Media attachment references per session (for @ mentions, FR-9)
 const mediaReferencesBySession = new Map<string, MediaAttachmentRefMain[]>();
@@ -3518,15 +3800,19 @@ interface MediaTaskTracker {
   sessionId: string;
   mediaType: 'image' | 'video';
   model: string;
+  ownerAccountKey: string;
+  accountGeneration: number;
   startedAt: number;
   pollCount: number;
   timeoutMs: number;
   lastPollAt?: number;
 }
 const pendingMediaTasks = new Map<string, MediaTaskTracker>();
+const mediaTaskOwnerById = new Map<string, string>();
 const mediaStatusPollCounts = new Map<string, number>();
 const mediaTasksHandledByStatusPolling = new Set<string>();
 let mediaTaskPollTimer: ReturnType<typeof setInterval> | null = null;
+let mediaTaskPollInFlight = false;
 const MEDIA_POLL_FAST_MS = 10_000;
 const MEDIA_POLL_SLOW_MS = 30_000;
 const MEDIA_POLL_MEDIUM_MS = 120_000;
@@ -3536,6 +3822,20 @@ const MEDIA_POLL_SLOW_COUNT = 18;
 const MEDIA_POLL_MEDIUM_COUNT = 10;
 const MEDIA_TASK_DEFAULT_TIMEOUT_MS = 172_800_000;
 const TERMINAL_MEDIA_TASK_STATUSES = new Set(['succeeded', 'failed', 'cancelled']);
+
+const rememberMediaTaskOwnership = (
+  ownerAccountKey: string,
+  ...taskIds: unknown[]
+): void => {
+  rememberMediaTaskOwnerAliases(mediaTaskOwnerById, ownerAccountKey, taskIds);
+};
+
+const resolveMediaTaskOwner = (taskId: unknown): string | undefined => {
+  const normalizedTaskId = String(taskId ?? '').trim();
+  if (!normalizedTaskId) return undefined;
+  return pendingMediaTasks.get(normalizedTaskId)?.ownerAccountKey
+    ?? mediaTaskOwnerById.get(normalizedTaskId);
+};
 
 const normalizeOptionalMediaModelId = (modelId: string | undefined): string | undefined => {
   const canonicalModelId = canonicalizeMediaModelId(modelId);
@@ -3565,7 +3865,10 @@ const resolveMediaSelectionForSession = (sessionId: string | null): MediaSelecti
     if (seen.has(current)) return undefined;
     seen.add(current);
 
-    const selection = normalizeMediaSelectionState(mediaSelectionBySession.get(current));
+    const selection = normalizeMediaSelectionState(resolveAccountBoundValue(
+      mediaSelectionBySession.get(current),
+      resolveCurrentMediaAccountScope(),
+    ));
     if (selection && selection.mode !== 'none') {
       return selection;
     }
@@ -3579,6 +3882,30 @@ const resolveMediaSelectionForSession = (sessionId: string | null): MediaSelecti
   }
 
   return undefined;
+};
+
+const resolveMediaTurnAccountScopeForSession = (
+  sessionId: string | null,
+): MediaAccountScope | null => {
+  let current = sessionId?.trim() || null;
+  const seen = new Set<string>();
+
+  for (let depth = 0; current && depth < 16; depth++) {
+    if (seen.has(current)) return null;
+    seen.add(current);
+
+    const scope = mediaTurnAccountScopeBySession.get(current);
+    if (scope) return scope;
+
+    try {
+      current = getCoworkParentSessionId(getStore().getDatabase(), current);
+    } catch (error) {
+      console.warn('[MediaGeneration] failed to resolve parent turn account scope:', error);
+      return null;
+    }
+  }
+
+  return null;
 };
 
 const getSkinRuntimeController = (): SkinRuntimeController => {
@@ -3764,30 +4091,83 @@ const getInitialTheme = (): 'light' | 'dark' => {
   return resolveThemeFromConfig(config);
 };
 
-const getMediaStatusPollKey = (sessionId: string | null, taskId: string): string =>
-  `${sessionId ?? 'unknown'}:${taskId}`;
+const MEDIA_STATUS_POLL_KEY_SEPARATOR = '\u0000';
 
-const incrementMediaStatusPollCount = (sessionId: string | null, taskId: string): number => {
-  const key = getMediaStatusPollKey(sessionId, taskId);
+const getMediaStatusPollKey = (
+  sessionId: string | null,
+  ownerAccountKey: string,
+  taskId: string,
+): string => (
+  [sessionId ?? 'unknown', ownerAccountKey, taskId].join(MEDIA_STATUS_POLL_KEY_SEPARATOR)
+);
+
+const incrementMediaStatusPollCount = (
+  sessionId: string | null,
+  ownerAccountKey: string,
+  taskId: string,
+): number => {
+  const key = getMediaStatusPollKey(sessionId, ownerAccountKey, taskId);
   const nextCount = (mediaStatusPollCounts.get(key) ?? 0) + 1;
   mediaStatusPollCounts.set(key, nextCount);
   return nextCount;
 };
 
-const markMediaTaskHandledByStatusPolling = (sessionId: string, taskId: string): void => {
-  mediaTasksHandledByStatusPolling.add(getMediaStatusPollKey(sessionId, taskId));
-  pendingMediaTasks.delete(taskId);
+const markMediaTaskHandledByStatusPolling = (
+  sessionId: string,
+  ownerAccountKey: string,
+  taskId: string,
+): void => {
+  mediaTasksHandledByStatusPolling.add(getMediaStatusPollKey(sessionId, ownerAccountKey, taskId));
+  const tracker = pendingMediaTasks.get(taskId);
+  if (tracker?.ownerAccountKey === ownerAccountKey) {
+    pendingMediaTasks.delete(taskId);
+  }
 };
 
-const isMediaTaskHandledByStatusPolling = (sessionId: string, taskId: string): boolean =>
-  mediaTasksHandledByStatusPolling.has(getMediaStatusPollKey(sessionId, taskId));
+const isMediaTaskHandledByStatusPolling = (
+  sessionId: string,
+  ownerAccountKey: string,
+  taskId: string,
+): boolean => (
+  mediaTasksHandledByStatusPolling.has(getMediaStatusPollKey(sessionId, ownerAccountKey, taskId))
+);
 
 const clearMediaStatusPollCountsForSession = (sessionId: string): void => {
+  const prefix = `${sessionId}${MEDIA_STATUS_POLL_KEY_SEPARATOR}`;
   for (const key of mediaStatusPollCounts.keys()) {
-    if (key.startsWith(`${sessionId}:`)) {
+    if (key.startsWith(prefix)) {
       mediaStatusPollCounts.delete(key);
     }
   }
+};
+
+const clearHandledMediaTasksForSession = (sessionId: string): void => {
+  const prefix = `${sessionId}${MEDIA_STATUS_POLL_KEY_SEPARATOR}`;
+  for (const key of mediaTasksHandledByStatusPolling) {
+    if (key.startsWith(prefix)) {
+      mediaTasksHandledByStatusPolling.delete(key);
+    }
+  }
+};
+
+const clearMediaPollingStateForOwner = (ownerAccountKey: string): void => {
+  const ownerSegment = `${MEDIA_STATUS_POLL_KEY_SEPARATOR}${ownerAccountKey}${MEDIA_STATUS_POLL_KEY_SEPARATOR}`;
+  for (const [taskId, tracker] of pendingMediaTasks) {
+    if (tracker.ownerAccountKey === ownerAccountKey) {
+      pendingMediaTasks.delete(taskId);
+    }
+  }
+  for (const key of mediaStatusPollCounts.keys()) {
+    if (key.includes(ownerSegment)) {
+      mediaStatusPollCounts.delete(key);
+    }
+  }
+  for (const key of mediaTasksHandledByStatusPolling) {
+    if (key.includes(ownerSegment)) {
+      mediaTasksHandledByStatusPolling.delete(key);
+    }
+  }
+  clearMediaTaskOwnerAliasesForOwner(mediaTaskOwnerById, ownerAccountKey);
 };
 
 const emitMediaStatusPollUpdate = (update: MediaStatusPollUpdate): void => {
@@ -3917,9 +4297,23 @@ if (!gotTheLock) {
     authCallbackRouter.handleDeepLink(url);
   };
 
+  // First-frame gate for window activation. Showing a window whose renderer
+  // has never painted produces a stuck plain-white window (field case: slow
+  // first load after install while security software scans the fresh files,
+  // user clicks the desktop icon, second-instance force-showed the blank
+  // window). Activation requests arriving before the first frame are queued
+  // and honored from ready-to-show / did-finish-load.
+  let hasRenderedFirstFrame = false;
+  let pendingShowOnFirstFrame = false;
+
   const focusMainWindow = (reason: string) => {
     if (!mainWindow || mainWindow.isDestroyed()) return;
     try {
+      if (!mainWindow.isVisible() && !hasRenderedFirstFrame) {
+        pendingShowOnFirstFrame = true;
+        console.log(`[Main] deferred showing main window after ${reason}: renderer has not painted yet`);
+        return;
+      }
       if (mainWindow.isMinimized()) mainWindow.restore();
       if (!mainWindow.isVisible()) mainWindow.show();
       mainWindow.moveTop();
@@ -3946,7 +4340,16 @@ if (!gotTheLock) {
       : level === 'warn' ? console.warn
         : level === 'debug' ? console.debug
           : console.log;
-    fn(`[Renderer][${tag}] ${message}`);
+    // Keep renderer diagnostics useful without allowing an accidental large
+    // payload or malformed tag to inflate the main-process log indefinitely.
+    const safeTag = (typeof tag === 'string' ? tag : 'Unknown')
+      .replace(/[^a-zA-Z0-9_.-]/g, '_')
+      .slice(0, 64) || 'Unknown';
+    const safeMessage = (typeof message === 'string' ? message : String(message ?? ''))
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 2_000);
+    fn(`[Renderer][${safeTag}] ${safeMessage}`);
   });
 
   // Allow renderer to retrieve a buffered auth code on init
@@ -3976,7 +4379,14 @@ if (!gotTheLock) {
   });
 
   // IPC 处理程序
+  // One-shot arrival log: renderer startup has stalled on this invoke in the
+  // field, and this line tells whether the request reached the main process.
+  let firstStoreGetLogged = false;
   ipcMain.handle('store:get', (_event, key) => {
+    if (!firstStoreGetLogged) {
+      firstStoreGetLogged = true;
+      console.log(`[Main] first store:get IPC received from renderer, key=${String(key)}`);
+    }
     return getStore().get(key);
   });
 
@@ -4057,11 +4467,15 @@ if (!gotTheLock) {
     getStore().delete(key);
   });
 
-  ipcMain.handle('enterprise:getConfig', async () => {
+  ipcMain.handle('enterprise:getConfig', () => {
     try {
-      return getStore().get('enterprise_config') ?? null;
-    } catch {
-      return null;
+      return {
+        success: true as const,
+        config: getStore().get('enterprise_config') ?? null,
+      };
+    } catch (error) {
+      console.error('[Enterprise] failed to read enterprise UI config:', error);
+      throw error;
     }
   });
 
@@ -4277,6 +4691,10 @@ if (!gotTheLock) {
 
   // ── Auth IPC handlers ──
 
+  let authAccountGeneration = 0;
+  let authExchangeIntentSequence = 0;
+  let activeAuthExchangeIntent: AuthExchangeIntentSnapshot | null = null;
+
   /**
    * Helper: Persist auth tokens into the kv store.
    */
@@ -4288,13 +4706,35 @@ if (!gotTheLock) {
     return getStore().get<{ accessToken: string; refreshToken: string }>('auth_tokens') || null;
   };
 
+  const captureAuthStateSnapshot = (): AuthStateSnapshot | null => {
+    const tokens = getAuthTokens();
+    return tokens
+      ? {
+        accountGeneration: authAccountGeneration,
+        accessToken: tokens.accessToken,
+        refreshToken: tokens.refreshToken,
+      }
+      : null;
+  };
+
+  const isCurrentAuthStateSnapshot = (snapshot: AuthStateSnapshot | null): boolean => (
+    snapshot !== null
+    && isAuthStateSnapshotCurrent(snapshot, authAccountGeneration, getAuthTokens())
+  );
+
   const clearAuthTokens = () => {
     getStore().delete('auth_tokens');
   };
 
+  const getEnterpriseAccountHeaders = (): Record<string, string> => (
+    buildEnterpriseAccountRequestHeaders(
+      getPersistedEnterpriseAccountContext(getStore()),
+    )
+  );
+
   const getAuthUser = (): Record<string, unknown> | null => {
     try {
-      return getStore().get<Record<string, unknown>>(AUTH_USER_STORE_KEY) || null;
+      return getStore().get<Record<string, unknown>>(LogReporterStoreKey.AuthUser) || null;
     } catch (error) {
       console.warn('[Auth] failed to read cached auth user:', error);
       return null;
@@ -4303,10 +4743,142 @@ if (!gotTheLock) {
 
   const saveAuthUser = (user: Record<string, unknown>) => {
     try {
-      getStore().set(AUTH_USER_STORE_KEY, user);
+      getStore().set(LogReporterStoreKey.AuthUser, user);
     } catch (error) {
       console.warn('[Auth] failed to save auth user for attribution:', error);
     }
+  };
+
+  const getCurrentMediaAccountScope = (): MediaAccountScope | null => {
+    if (!getAuthTokens()) return null;
+    try {
+      const user = getStore().get<Record<string, unknown>>(LogReporterStoreKey.AuthUser);
+      const enterpriseContext = getPersistedEnterpriseAccountContext(getStore());
+      if (
+        !enterpriseContext
+        && (
+          user?.accountMode === EnterpriseAccountMode.Enterprise
+          || cachedSubscriptionStatus === AuthSubscriptionStatus.Enterprise
+        )
+      ) {
+        return null;
+      }
+      const ownerAccountKey = createAccountOwnerKey({
+        user,
+        enterpriseId: enterpriseContext?.enterpriseId,
+      });
+      return ownerAccountKey
+        ? { ownerAccountKey, accountGeneration: authAccountGeneration }
+        : null;
+    } catch (error) {
+      console.warn('[MediaGeneration] failed to resolve authenticated account owner:', error);
+      return null;
+    }
+  };
+  resolveCurrentMediaAccountScope = getCurrentMediaAccountScope;
+
+  const captureEnterpriseAuthSessionSnapshot = (
+    accountScope = getCurrentMediaAccountScope(),
+  ) => createEnterpriseAuthSessionSnapshot(
+    accountScope,
+    getPersistedEnterpriseAccountContext(getStore())?.enterpriseId,
+  );
+
+  const handleEnterpriseMembershipRevocation = createEnterpriseMembershipRevocationHandler({
+    getCurrentSession: captureEnterpriseAuthSessionSnapshot,
+    invalidateCurrentSession: (event) => {
+      console.warn(
+        '[EnterpriseAccount] invalidating revoked enterprise auth session '
+        + `source=${event.source} code=${event.code} `
+        + `generation=${event.requestSession?.accountGeneration ?? 'unknown'}`,
+      );
+      clearLocalAuthSession({
+        reason: AuthSessionChangeReason.EnterpriseMembershipRevoked,
+        notifyRenderer: true,
+      });
+    },
+  });
+
+  const notifyAuthQuotaChanged = (): void => {
+    BrowserWindow.getAllWindows().forEach(win => {
+      if (!win.isDestroyed()) win.webContents.send(AuthIpcChannel.QuotaChanged);
+    });
+  };
+
+  const handleEnterpriseAccountContextMismatch = (
+    code: number,
+    requestAccountScope: MediaAccountScope | null,
+  ): boolean => {
+    if (code === EnterpriseApiErrorCode.NotMember) {
+      return handleEnterpriseMembershipRevocation({
+        code,
+        source: EnterpriseMembershipRevocationSource.JsonApi,
+        requestSession: captureEnterpriseAuthSessionSnapshot(requestAccountScope),
+      });
+    }
+
+    const currentAccountScope = getCurrentMediaAccountScope();
+    if (
+      code !== EnterpriseApiErrorCode.AccountModeMismatch
+      || !getAuthTokens()
+      || !isMediaAccountScopeSnapshotCurrent(requestAccountScope, currentAccountScope)
+    ) {
+      return false;
+    }
+
+    authExchangeIntentSequence += 1;
+    activeAuthExchangeIntent = null;
+    authAccountGeneration += 1;
+    const quotaGateChanged = (
+      cachedSubscriptionStatus !== AuthSubscriptionStatus.Free
+      || cachedMediaGenerationEntitled
+    );
+    cachedSubscriptionStatus = AuthSubscriptionStatus.Free;
+    cachedMediaGenerationEntitled = false;
+    clearAuthTokens();
+    clearAuthUser();
+    clearEnterpriseAccountContext(getStore());
+    clearServerModelMetadata();
+    mediaSelectionBySession.clear();
+    mediaTurnAccountScopeBySession.clear();
+    mediaReferencesBySession.clear();
+    if (requestAccountScope) {
+      clearMediaPollingStateForOwner(requestAccountScope.ownerAccountKey);
+    }
+    if (pendingMediaTasks.size === 0) {
+      stopMediaPollTimer();
+    }
+    syncOpenClawConfig({
+      reason: 'enterprise-account-context-invalidated',
+      restartGatewayIfRunning: quotaGateChanged,
+    }).catch(error => {
+      console.warn('[EnterpriseAccount] failed to sync OpenClaw after context invalidation:', error);
+    });
+
+    BrowserWindow.getAllWindows().forEach(win => {
+      if (!win.isDestroyed()) {
+        win.webContents.send(EnterpriseAccountIpcChannel.ContextInvalidated);
+      }
+    });
+
+    const dialogOptions = {
+      type: 'warning' as const,
+      title: t('enterpriseAccountContextMismatchTitle'),
+      message: t('enterpriseAccountContextMismatchMessage'),
+      buttons: [t('enterpriseAccountContextMismatchConfirm')],
+    };
+    const ownerWindow = BrowserWindow.getFocusedWindow()
+      ?? (mainWindow && !mainWindow.isDestroyed() ? mainWindow : null);
+    const prompt = ownerWindow
+      ? dialog.showMessageBox(ownerWindow, dialogOptions)
+      : dialog.showMessageBox(dialogOptions);
+    void prompt.catch(error => {
+      console.warn('[EnterpriseAccount] failed to show account context mismatch prompt:', error);
+    });
+    console.warn(
+      `[EnterpriseAccount] invalidated account context and media polling after server code ${code}`,
+    );
+    return true;
   };
 
   const getAuthUserId = (): string | null => {
@@ -4324,7 +4896,7 @@ if (!gotTheLock) {
 
   const clearAuthUser = () => {
     try {
-      getStore().delete(AUTH_USER_STORE_KEY);
+      getStore().delete(LogReporterStoreKey.AuthUser);
     } catch (error) {
       console.warn('[Auth] failed to clear auth user for attribution:', error);
     }
@@ -4394,13 +4966,37 @@ if (!gotTheLock) {
     }
   };
 
+  const getAuthSessionKey = (): string | null => {
+    if (!getAuthTokens()) return null;
+    const scope = getCurrentMediaAccountScope();
+    return `${scope?.ownerAccountKey ?? 'unresolved'}:${authAccountGeneration}`;
+  };
+
   const authSessionManager = new AuthSessionManager({
     getTokens: getAuthTokens,
+    getSessionKey: getAuthSessionKey,
     saveTokens: tokens => saveAuthTokens(tokens.accessToken, tokens.refreshToken),
-    fetch: (url, options) => net.fetch(url, options),
+    fetch: (url, options) => {
+      const headers = new Headers(options?.headers);
+      for (const [name, value] of Object.entries(getEnterpriseAccountHeaders())) {
+        headers.set(name, value);
+      }
+      return net.fetch(url, {
+        ...options,
+        headers,
+      });
+    },
     getRefreshUrl: () => `${getServerApiBaseUrl()}/api/auth/refresh`,
     buildRefreshRequestBody: refreshToken => JSON.stringify(withKeyfromBody({ refreshToken })),
-    onTerminalFailure: () => {
+    onTerminalFailure: (result) => {
+      if (result.errorCode === EnterpriseApiErrorCode.NotMember) {
+        handleEnterpriseMembershipRevocation({
+          code: result.errorCode,
+          source: EnterpriseMembershipRevocationSource.Refresh,
+          requestSession: captureEnterpriseAuthSessionSnapshot(),
+        });
+        return;
+      }
       clearLocalAuthSession({
         reason: AuthSessionChangeReason.RefreshRejected,
         notifyRenderer: true,
@@ -4428,8 +5024,28 @@ if (!gotTheLock) {
   });
   waitForPendingTokenRefresh = () => authSessionManager.waitForPendingRefresh();
 
-  const fetchWithAuth = (url: string, options?: RequestInit): Promise<Response> =>
-    authSessionManager.fetchWithAuth(url, options);
+  const fetchWithAuth = async (url: string, options?: RequestInit): Promise<Response> => {
+    const requestEnterpriseSession = captureEnterpriseAuthSessionSnapshot();
+    const response = await authSessionManager.fetchWithAuth(url, options);
+    if (
+      requestEnterpriseSession
+      && response.headers.get('content-type')?.includes('application/json')
+    ) {
+      try {
+        const code = readEnterpriseApiErrorCode(await response.clone().json());
+        if (code === EnterpriseApiErrorCode.NotMember) {
+          handleEnterpriseMembershipRevocation({
+            code,
+            source: resolveEnterpriseMembershipRevocationSource(url),
+            requestSession: requestEnterpriseSession,
+          });
+        }
+      } catch {
+        // The original response remains available to the endpoint-specific parser.
+      }
+    }
+    return response;
+  };
 
   type AvailableServerModel = ServerModelMetadataInput & {
     modelId: string;
@@ -4447,6 +5063,8 @@ if (!gotTheLock) {
     awaitConfigSync?: boolean;
     forceConfigSync?: boolean;
   }): Promise<AvailableServerModel[]> => {
+    const requestAccountGeneration = authAccountGeneration;
+    const requestAccountScope = getCurrentMediaAccountScope();
     const serverBaseUrl = getServerApiBaseUrl();
     const url = appendKeyfromQuery(`${serverBaseUrl}/api/models/available`);
     console.log(`[Auth:getModels] requesting available models at ${url}`);
@@ -4458,11 +5076,25 @@ if (!gotTheLock) {
       throw new Error(`Server model request failed with HTTP ${resp.status}.`);
     }
 
+    const responseAuthState = captureAuthStateSnapshot();
     const data = (await resp.json()) as {
       code: number;
       message?: string;
       data?: AvailableServerModel[];
     };
+    if (
+      authAccountGeneration !== requestAccountGeneration
+      || !isCurrentAuthStateSnapshot(responseAuthState)
+      || !isMediaAccountScopeSnapshotCurrent(
+        requestAccountScope,
+        getCurrentMediaAccountScope(),
+      )
+    ) {
+      throw new Error('Account changed while loading server models');
+    }
+    if (handleEnterpriseAccountContextMismatch(data.code ?? -1, requestAccountScope)) {
+      throw new Error('Enterprise account context changed while loading server models');
+    }
     console.log('[Auth:getModels] Response data:', JSON.stringify(data).slice(0, 500));
     if (data.code !== 0 || !Array.isArray(data.data)) {
       throw new Error(data.message || 'Server model response is invalid.');
@@ -4508,6 +5140,8 @@ if (!gotTheLock) {
         supportsImage: metadata?.supportsImage,
         supportsVideo: metadata?.supportsVideo,
         supportsThinking: metadata?.supportsThinking,
+        thinkingConfig: metadata?.thinkingConfig,
+        requestCapabilities: metadata?.requestCapabilities,
         supportsToolCalling: metadata?.supportsToolCalling,
         agenticReady: metadata?.agenticReady,
         contextWindow: metadata?.contextWindow,
@@ -4670,6 +5304,112 @@ if (!gotTheLock) {
     };
   };
 
+  const capturePublishingRequest = (): {
+    accountScope: MediaAccountScope;
+    scopedFetch: typeof fetchWithAuth;
+  } => {
+    const accountScope = getCurrentMediaAccountScope();
+    if (accountScope === null) {
+      throw new Error(t('authLoginRequired'));
+    }
+    return {
+      accountScope,
+      scopedFetch: createAccountScopedFetch(
+        accountScope,
+        getCurrentMediaAccountScope,
+        fetchWithAuth,
+      ),
+    };
+  };
+
+  let pendingEnterpriseAccountContextRefresh: {
+    generation: number;
+    promise: ReturnType<typeof fetchEnterpriseAccountContext>;
+  } | null = null;
+
+  const refreshEnterpriseAccountContext = (): ReturnType<typeof fetchEnterpriseAccountContext> => {
+    const generation = authAccountGeneration;
+    const requestAccountScope = getCurrentMediaAccountScope();
+    const requestEnterpriseSession = captureEnterpriseAuthSessionSnapshot(requestAccountScope);
+    if (pendingEnterpriseAccountContextRefresh?.generation === generation) {
+      return pendingEnterpriseAccountContextRefresh.promise;
+    }
+
+    const promise = fetchEnterpriseAccountContext({
+      getServerBaseUrl: getServerApiBaseUrl,
+      fetchWithAuth,
+      store: getStore(),
+      isRequestCurrent: () => authAccountGeneration === generation && getAuthTokens() !== null,
+      onAccountModeMismatch: () => {
+        handleEnterpriseAccountContextMismatch(
+          EnterpriseApiErrorCode.AccountModeMismatch,
+          requestAccountScope,
+        );
+      },
+      onMembershipRevoked: () => {
+        handleEnterpriseMembershipRevocation({
+          code: EnterpriseApiErrorCode.NotMember,
+          source: EnterpriseMembershipRevocationSource.EnterpriseContext,
+          requestSession: requestEnterpriseSession,
+        });
+      },
+    }).finally(() => {
+      if (pendingEnterpriseAccountContextRefresh?.promise === promise) {
+        pendingEnterpriseAccountContextRefresh = null;
+      }
+    });
+    pendingEnterpriseAccountContextRefresh = { generation, promise };
+    return promise;
+  };
+
+  const syncEnterpriseAccountContextFromPayload = async (
+    payload: unknown,
+  ) => {
+    const context = normalizeEnterpriseAccountContext(payload);
+    if (context) {
+      persistEnterpriseAccountContext(getStore(), context);
+      console.debug(`[EnterpriseAccount] applied context from auth payload for enterprise ${context.enterpriseId} with role ${context.role}`);
+      return context;
+    }
+
+    if (readAccountMode(payload) === EnterpriseAccountMode.Personal) {
+      clearEnterpriseAccountContext(getStore());
+      console.debug('[EnterpriseAccount] cleared context from personal auth payload');
+      return null;
+    }
+
+    const result = await refreshEnterpriseAccountContext();
+    return result.context;
+  };
+
+  registerEnterpriseAccountHandlers({
+    getContext: refreshEnterpriseAccountContext,
+    getIdentities: () => {
+      const generation = authAccountGeneration;
+      return fetchEnterpriseAccountIdentities({
+        getServerBaseUrl: getServerApiBaseUrl,
+        fetchWithAuth,
+        isRequestCurrent: () => authAccountGeneration === generation && getAuthTokens() !== null,
+      });
+    },
+    requestQuotaIncrease: (enterpriseId, requestType) => {
+      const currentContext = getPersistedEnterpriseAccountContext(getStore());
+      if (!currentContext || currentContext.enterpriseId !== enterpriseId) {
+        console.warn('[EnterpriseAccount] rejected quota request outside the current enterprise context');
+        return Promise.resolve({
+          success: false,
+          error: 'Enterprise account context changed before the quota request',
+        });
+      }
+      const generation = authAccountGeneration;
+      return requestEnterpriseQuotaIncrease({
+        getServerBaseUrl: getServerApiBaseUrl,
+        fetchWithAuth,
+        isRequestCurrent: () => authAccountGeneration === generation && getAuthTokens() !== null,
+      }, enterpriseId, requestType);
+    },
+  });
+
   const extractSessionIdFromKey = (sessionKey: string): string | null =>
     resolveCoworkSessionIdByOpenClawSessionKey(getStore().getDatabase(), sessionKey);
 
@@ -4689,6 +5429,25 @@ if (!gotTheLock) {
     const action = (args.action as string) || 'generate';
     const serverBaseUrl = getServerApiBaseUrl();
     const sessionId = extractSessionIdFromKey(request.context.sessionKey);
+    const requestAccountScope = resolveMediaTurnAccountScopeForSession(sessionId);
+    const isRequestAccountCurrent = (): boolean => (
+      requestAccountScope !== null
+      && isMediaAccountScopeCurrent(requestAccountScope, getCurrentMediaAccountScope())
+    );
+    const staleAccountResult = () => ({
+      content: [{
+        type: 'text',
+        text: t('authAccountChanged'),
+      }],
+      isError: true,
+      details: { status: 'cancelled', warnings: ['MEDIA_ACCOUNT_CHANGED'] },
+    });
+    if (
+      requestAccountScope === null
+      || !isMediaAccountScopeCurrent(requestAccountScope, getCurrentMediaAccountScope())
+    ) {
+      return staleAccountResult();
+    }
     const selection = resolveMediaSelectionForSession(sessionId);
     const prompt = typeof args.prompt === 'string' ? args.prompt : '';
     const explicitModel = canonicalizeMediaModelId(typeof args.model === 'string' ? args.model : '');
@@ -4703,6 +5462,7 @@ if (!gotTheLock) {
         sessionId,
         selection,
       );
+      if (!isRequestAccountCurrent()) return staleAccountResult();
       if (skinPreflight) return skinPreflight;
     }
 
@@ -4748,6 +5508,13 @@ if (!gotTheLock) {
         const resp = await fetchWithAuth(`${serverBaseUrl}${endpoint}`);
         console.log(`[MediaGeneration] server returned HTTP ${resp.status} for ${mediaType} model list.`);
         const body = await resp.json() as { code: number; data?: unknown[]; message?: string };
+        if (!isRequestAccountCurrent()) return staleAccountResult();
+        if (handleEnterpriseAccountContextMismatch(body.code, requestAccountScope)) {
+          return {
+            content: [{ type: 'text', text: t('enterpriseAccountContextMismatchMessage') }],
+            isError: true,
+          };
+        }
         if (body.code !== 0) {
           console.warn('[MediaGeneration] server rejected model list request:', serializeForLog({ mediaType, code: body.code, message: body.message }));
           return { content: [{ type: 'text', text: body.message || 'Failed to list models.' }], isError: true };
@@ -4782,18 +5549,43 @@ if (!gotTheLock) {
           console.warn('[MediaGeneration] blocked status request because taskId was missing.');
           return { content: [{ type: 'text', text: 'taskId is required for status action.' }], isError: true };
         }
-        const pollCount = incrementMediaStatusPollCount(sessionId, taskId);
+        if (requestAccountScope === null) return staleAccountResult();
+        const taskOwnerAccountKey = resolveMediaTaskOwner(taskId);
+        if (!canAccessTrackedMediaTask(taskOwnerAccountKey, requestAccountScope)) {
+          return staleAccountResult();
+        }
+        const pollCount = incrementMediaStatusPollCount(
+          sessionId,
+          requestAccountScope.ownerAccountKey,
+          taskId,
+        );
         const mediaType = tool === MediaGenerationTool.Image ? 'images' : 'videos';
         const statusMediaType = tool === MediaGenerationTool.Image ? 'image' : 'video';
         console.log(`[MediaGeneration] checking ${mediaType} task status for task ${taskId}.`);
         const resp = await fetchWithAuth(`${serverBaseUrl}/api/media/${mediaType}/tasks/${taskId}`);
         console.log(`[MediaGeneration] server returned HTTP ${resp.status} for ${mediaType} task status.`);
         const body = await resp.json() as { code: number; data?: Record<string, unknown>; message?: string };
+        if (!isRequestAccountCurrent()) return staleAccountResult();
+        if (handleEnterpriseAccountContextMismatch(body.code, requestAccountScope)) {
+          return {
+            content: [{ type: 'text', text: t('enterpriseAccountContextMismatchMessage') }],
+            isError: true,
+            details: {
+              status: 'failed',
+              warnings: ['ENTERPRISE_ACCOUNT_CONTEXT_MISMATCH'],
+            },
+          };
+        }
         if (body.code !== 0) {
           console.warn('[MediaGeneration] server rejected task status request:', serializeForLog({ mediaType, taskId, code: body.code, message: body.message }));
           return { content: [{ type: 'text', text: body.message || 'Failed to get task status.' }], isError: true };
         }
         const task = body.data!;
+        rememberMediaTaskOwnership(
+          requestAccountScope.ownerAccountKey,
+          task.taskId,
+          task.upstreamTaskId,
+        );
         const status = task.status as string;
         const resultUrls = (task.resultUrls as string[]) || [];
         const outputModel = mediaModelIdForOutput(task.model);
@@ -4804,7 +5596,11 @@ if (!gotTheLock) {
           ? task.modelSelectionReason.trim()
           : undefined;
         if (sessionId && TERMINAL_MEDIA_TASK_STATUSES.has(status)) {
-          markMediaTaskHandledByStatusPolling(sessionId, taskId);
+          markMediaTaskHandledByStatusPolling(
+            sessionId,
+            requestAccountScope.ownerAccountKey,
+            taskId,
+          );
         }
         const assets = resultUrls.map(url => ({
           type: statusMediaType,
@@ -4816,6 +5612,7 @@ if (!gotTheLock) {
         let detailsAssets: unknown[] = assets;
         if (status === 'succeeded' && statusMediaType === 'image' && sessionId) {
           const persistResult = await persistGeneratedImages(sessionId, assets);
+          if (!isRequestAccountCurrent()) return staleAccountResult();
           if (persistResult && persistResult.saved.length > 0) {
             detailsAssets = persistResult.saved;
             resultLines = persistResult.saved.map(asset =>
@@ -4826,6 +5623,7 @@ if (!gotTheLock) {
           }
         } else if (status === 'succeeded' && statusMediaType === 'video' && sessionId) {
           const persistResult = await persistGeneratedVideos(sessionId, assets);
+          if (!isRequestAccountCurrent()) return staleAccountResult();
           if (persistResult && persistResult.saved.length > 0) {
             detailsAssets = persistResult.saved;
             resultLines = persistResult.saved.map(asset =>
@@ -4882,10 +5680,22 @@ if (!gotTheLock) {
           console.warn('[MediaGeneration] blocked cancel request because taskId was missing.');
           return { content: [{ type: 'text', text: 'taskId is required for cancel action.' }], isError: true };
         }
+        if (requestAccountScope === null) return staleAccountResult();
+        const taskOwnerAccountKey = resolveMediaTaskOwner(taskId);
+        if (!canAccessTrackedMediaTask(taskOwnerAccountKey, requestAccountScope)) {
+          return staleAccountResult();
+        }
         console.log(`[MediaGeneration] cancelling video task ${taskId}.`);
         const resp = await fetchWithAuth(`${serverBaseUrl}/api/media/videos/tasks/${taskId}/cancel`, { method: 'POST' });
         console.log(`[MediaGeneration] server returned HTTP ${resp.status} for video task cancel.`);
         const body = await resp.json() as { code: number; message?: string };
+        if (!isRequestAccountCurrent()) return staleAccountResult();
+        if (handleEnterpriseAccountContextMismatch(body.code, requestAccountScope)) {
+          return {
+            content: [{ type: 'text', text: t('enterpriseAccountContextMismatchMessage') }],
+            isError: true,
+          };
+        }
         if (body.code !== 0) {
           console.warn('[MediaGeneration] server rejected task cancel request:', serializeForLog({ taskId, code: body.code, message: body.message }));
           return { content: [{ type: 'text', text: body.message || 'Failed to cancel task.' }], isError: true };
@@ -4932,6 +5742,7 @@ if (!gotTheLock) {
         const userCancelled = confirmResponse?.behavior === 'deny'
           || confirmResponse?.answers?.[questionText] === '取消';
 
+        if (!isRequestAccountCurrent()) return staleAccountResult();
         if (userCancelled) {
           console.log('[MediaGeneration] user cancelled video generation confirmation.');
           return {
@@ -5112,14 +5923,55 @@ if (!gotTheLock) {
         promptPreview: prompt.slice(0, 120),
         params: summarizeMediaGenerationParamsForLog(params),
       }));
+      if (!isRequestAccountCurrent()) return staleAccountResult();
+      const idempotencyKey = crypto.randomUUID();
       const resp = await fetchWithAuth(`${serverBaseUrl}${endpoint}`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': idempotencyKey,
+        },
         body: JSON.stringify(generateReq),
       });
       console.log(`[MediaGeneration] server returned HTTP ${resp.status} for ${mediaType} generate request.`);
       const body = await resp.json() as { code: number; data?: Record<string, unknown>; message?: string };
+      if (!isRequestAccountCurrent()) return staleAccountResult();
+      if (handleEnterpriseAccountContextMismatch(body.code, requestAccountScope)) {
+        return {
+          content: [{ type: 'text', text: t('enterpriseAccountContextMismatchMessage') }],
+          isError: true,
+          details: {
+            status: 'failed',
+            warnings: ['ENTERPRISE_ACCOUNT_CONTEXT_MISMATCH'],
+          },
+        };
+      }
 
+      const enterpriseQuotaError = resolveEnterpriseQuotaError(body.code, body.message);
+      if (enterpriseQuotaError) {
+        console.warn('[MediaGeneration] server rejected generate request because enterprise quota is unavailable:', serializeForLog({
+          mediaType,
+          selectedModel,
+          code: enterpriseQuotaError.code,
+          reason: enterpriseQuotaError.reason,
+          message: body.message,
+        }));
+        notifyAuthQuotaChanged();
+        const message = body.message?.trim() || t('enterpriseMediaQuotaUnavailable');
+        return {
+          content: [{
+            type: 'text',
+            text: `${message} (error ${enterpriseQuotaError.code})`,
+          }],
+          isError: true,
+          details: {
+            status: 'failed',
+            [EnterpriseQuotaMessageMetadataKey.ErrorCode]: enterpriseQuotaError.code,
+            [EnterpriseQuotaMessageMetadataKey.Reason]: enterpriseQuotaError.reason,
+            warnings: [enterpriseQuotaError.reason],
+          },
+        };
+      }
       if (body.code === 40203) {
         console.warn('[MediaGeneration] server rejected generate request because subscription is required.');
         return {
@@ -5146,6 +5998,11 @@ if (!gotTheLock) {
       }
 
       const task = body.data!;
+      rememberMediaTaskOwnership(
+        requestAccountScope.ownerAccountKey,
+        task.taskId,
+        task.upstreamTaskId,
+      );
       const status = task.status as string;
       const resultUrls = (task.resultUrls as string[]) || [];
       const outputModel = mediaModelIdForOutput(task.model, selectedModel);
@@ -5194,6 +6051,7 @@ if (!gotTheLock) {
 
       if (status === 'succeeded' && mediaType === 'image' && sessionId) {
         const persistResult = await persistGeneratedImages(sessionId, assets);
+        if (!isRequestAccountCurrent()) return staleAccountResult();
         if (persistResult && persistResult.saved.length > 0) {
           detailsAssets = persistResult.saved;
           const fileLines = persistResult.saved.map(asset =>
@@ -5206,6 +6064,7 @@ if (!gotTheLock) {
         }
       } else if (status === 'succeeded' && mediaType === 'video' && sessionId) {
         const persistResult = await persistGeneratedVideos(sessionId, assets);
+        if (!isRequestAccountCurrent()) return staleAccountResult();
         if (persistResult && persistResult.saved.length > 0) {
           detailsAssets = persistResult.saved;
           const fileLines = persistResult.saved.map(asset =>
@@ -5223,7 +6082,7 @@ if (!gotTheLock) {
 
       // Register async media tasks for background polling if not already completed.
       if (status !== 'succeeded' && status !== 'failed' && status !== 'cancelled') {
-        if (sessionId) {
+        if (sessionId && requestAccountScope && isRequestAccountCurrent()) {
           const metadata = task.metadata as Record<string, unknown> | undefined;
           const expiresAfterSec = metadata?.execution_expires_after ?? task.execution_expires_after;
           const timeoutMs = typeof expiresAfterSec === 'number' && expiresAfterSec > 0
@@ -5234,6 +6093,8 @@ if (!gotTheLock) {
             sessionId,
             mediaType,
             model: upstreamModel || outputModel,
+            ownerAccountKey: requestAccountScope.ownerAccountKey,
+            accountGeneration: requestAccountScope.accountGeneration,
             startedAt: Date.now(),
             pollCount: 0,
             timeoutMs,
@@ -5241,6 +6102,7 @@ if (!gotTheLock) {
         }
       }
 
+      if (!isRequestAccountCurrent()) return staleAccountResult();
       return {
         content: [{ type: 'text', text: lines.join('\n') }],
         details: {
@@ -5255,10 +6117,11 @@ if (!gotTheLock) {
         },
       };
     } catch (error) {
+      if (!isRequestAccountCurrent()) return staleAccountResult();
       const msg = error instanceof Error ? error.message : String(error);
       if (msg === 'No auth tokens') {
         console.warn('[MediaGeneration] blocked media generation because the user is not logged in.');
-        return { content: [{ type: 'text', text: 'Not logged in. Please log in to use media generation.' }], isError: true };
+        return { content: [{ type: 'text', text: t('authLoginRequired') }], isError: true };
       }
       console.error('[MediaGeneration] media generation request failed:', error);
       return { content: [{ type: 'text', text: `Media generation error: ${msg}` }], isError: true };
@@ -5268,6 +6131,7 @@ if (!gotTheLock) {
   getMcpRuntime().setMediaGenerationHandler(handleMediaGenerationCallback);
 
   const registerMediaTaskForPolling = (tracker: MediaTaskTracker) => {
+    rememberMediaTaskOwnership(tracker.ownerAccountKey, tracker.taskId);
     pendingMediaTasks.set(tracker.taskId, tracker);
     ensureMediaPollTimerRunning();
   };
@@ -5275,7 +6139,13 @@ if (!gotTheLock) {
   const ensureMediaPollTimerRunning = () => {
     if (mediaTaskPollTimer) return;
     mediaTaskPollTimer = setInterval(() => {
-      void pollPendingMediaTasks();
+      if (mediaTaskPollInFlight) return;
+      mediaTaskPollInFlight = true;
+      void pollPendingMediaTasks().catch(error => {
+        console.warn('[MediaGeneration] pending task polling cycle failed:', error);
+      }).finally(() => {
+        mediaTaskPollInFlight = false;
+      });
     }, MEDIA_POLL_FAST_MS);
   };
 
@@ -5294,16 +6164,37 @@ if (!gotTheLock) {
 
     const serverBaseUrl = getServerApiBaseUrl();
     const now = Date.now();
-    const tasksToRemove: string[] = [];
+    const tasksToRemove = new Map<string, MediaTaskTracker>();
 
     for (const [taskId, tracker] of pendingMediaTasks) {
-      if (isMediaTaskHandledByStatusPolling(tracker.sessionId, taskId)) {
-        tasksToRemove.push(taskId);
+      const reboundAccountScope = rebindMediaAccountScope(
+        tracker.ownerAccountKey,
+        getCurrentMediaAccountScope(),
+      );
+      if (reboundAccountScope === null) {
+        // Keep the task paused in memory. If the user switches back to the
+        // owning account, polling resumes with that account's new generation.
+        continue;
+      }
+      if (tracker.accountGeneration !== reboundAccountScope.accountGeneration) {
+        tracker.accountGeneration = reboundAccountScope.accountGeneration;
+      }
+      const trackerAccountScope: MediaAccountScope = {
+        ownerAccountKey: tracker.ownerAccountKey,
+        accountGeneration: tracker.accountGeneration,
+      };
+
+      if (isMediaTaskHandledByStatusPolling(
+        tracker.sessionId,
+        tracker.ownerAccountKey,
+        taskId,
+      )) {
+        tasksToRemove.set(taskId, tracker);
         continue;
       }
 
       if (now - tracker.startedAt > tracker.timeoutMs) {
-        tasksToRemove.push(taskId);
+        tasksToRemove.set(taskId, tracker);
         emitMediaTaskMessage(tracker.sessionId, `${tracker.mediaType === 'video' ? 'Video' : 'Image'} generation timed out.\nTask ID: ${taskId}\nStatus: timeout`);
         continue;
       }
@@ -5330,16 +6221,28 @@ if (!gotTheLock) {
         const resp = await fetchWithAuth(`${serverBaseUrl}/api/media/${endpoint}/tasks/${taskId}`);
         const body = await resp.json() as { code: number; data?: Record<string, unknown>; message?: string };
 
+        if (!isMediaAccountScopeCurrent(trackerAccountScope, getCurrentMediaAccountScope())) {
+          continue;
+        }
+        if (handleEnterpriseAccountContextMismatch(body.code, trackerAccountScope)) continue;
         if (body.code !== 0) continue;
         const task = body.data!;
+        rememberMediaTaskOwnership(
+          tracker.ownerAccountKey,
+          task.taskId,
+          task.upstreamTaskId,
+        );
         const status = task.status as string;
-        if (isMediaTaskHandledByStatusPolling(tracker.sessionId, taskId)) {
-          tasksToRemove.push(taskId);
+        if (isMediaTaskHandledByStatusPolling(
+          tracker.sessionId,
+          tracker.ownerAccountKey,
+          taskId,
+        )) {
+          tasksToRemove.set(taskId, tracker);
           continue;
         }
 
         if (TERMINAL_MEDIA_TASK_STATUSES.has(status)) {
-          tasksToRemove.push(taskId);
           const resultUrls = (task.resultUrls as string[]) || [];
           const outputModel = mediaModelIdForOutput(task.model, tracker.model);
           const upstreamModel = typeof task.upstreamModel === 'string' && task.upstreamModel.trim()
@@ -5356,6 +6259,9 @@ if (!gotTheLock) {
           }));
           if (status === 'succeeded' && tracker.mediaType === 'image') {
             const persistResult = await persistGeneratedImages(tracker.sessionId, assets);
+            if (!isMediaAccountScopeCurrent(trackerAccountScope, getCurrentMediaAccountScope())) {
+              continue;
+            }
             if (persistResult && persistResult.saved.length > 0) {
               const fileLines = persistResult.saved.map(asset => `  - [${asset.filename}](${pathToFileURL(asset.filePath).toString()})`);
               emitMediaTaskMessage(
@@ -5381,6 +6287,9 @@ if (!gotTheLock) {
             }
           } else if (status === 'succeeded' && tracker.mediaType === 'video') {
             const persistResult = await persistGeneratedVideos(tracker.sessionId, assets);
+            if (!isMediaAccountScopeCurrent(trackerAccountScope, getCurrentMediaAccountScope())) {
+              continue;
+            }
             if (persistResult && persistResult.saved.length > 0) {
               const fileLines = persistResult.saved.map(asset => `  - [${asset.filename}](${pathToFileURL(asset.filePath).toString()})`);
               emitMediaTaskMessage(
@@ -5425,17 +6334,32 @@ if (!gotTheLock) {
             ];
             emitMediaTaskMessage(tracker.sessionId, lines.join('\n'));
           }
-          BrowserWindow.getAllWindows().forEach(win => {
-            if (!win.isDestroyed()) win.webContents.send(AuthIpcChannel.QuotaChanged);
-          });
+          if (!shouldRemoveMediaTaskAfterPoll(
+            trackerAccountScope,
+            getCurrentMediaAccountScope(),
+            true,
+          )) {
+            continue;
+          }
+          tasksToRemove.set(taskId, tracker);
+          notifyAuthQuotaChanged();
         }
-      } catch {
-        // Network error, retry on next poll
+      } catch (error) {
+        // Keep retries quiet during transient failures while retaining enough
+        // sampled context to diagnose a task that remains stuck for hours.
+        if (tracker.pollCount === 1 || tracker.pollCount % 10 === 0) {
+          console.warn(
+            `[MediaGeneration] pending ${tracker.mediaType} task ${taskId} poll failed; retrying`,
+            error,
+          );
+        }
       }
     }
 
-    for (const taskId of tasksToRemove) {
-      pendingMediaTasks.delete(taskId);
+    for (const [taskId, tracker] of tasksToRemove) {
+      if (pendingMediaTasks.get(taskId) === tracker) {
+        pendingMediaTasks.delete(taskId);
+      }
     }
 
     if (pendingMediaTasks.size === 0) {
@@ -5602,17 +6526,33 @@ if (!gotTheLock) {
     reason: AuthSessionChangeReason;
     notifyRenderer: boolean;
   }): void => {
+    const previousAccountScope = getCurrentMediaAccountScope();
     const previousQuotaGateState = getAuthQuotaGateState();
+    authExchangeIntentSequence += 1;
+    activeAuthExchangeIntent = null;
+    authAccountGeneration += 1;
+    mediaSelectionBySession.clear();
+    mediaTurnAccountScopeBySession.clear();
+    mediaReferencesBySession.clear();
+    if (previousAccountScope) {
+      clearMediaPollingStateForOwner(previousAccountScope.ownerAccountKey);
+    }
+    if (pendingMediaTasks.size === 0) {
+      stopMediaPollTimer();
+    }
     clearAuthTokens();
     clearAuthUser();
+    clearEnterpriseAccountContext(getStore());
     clearServerModelMetadata();
     resetAuthQuotaGateState();
 
     const quotaGateSyncScheduled = syncOpenClawConfigIfAuthQuotaGateChanged(previousQuotaGateState);
     if (!quotaGateSyncScheduled) {
-      const syncReason = options.reason === AuthSessionChangeReason.RefreshRejected
-        ? 'auth-session-expired-server-models-cleared'
-        : 'auth-logout-server-models-cleared';
+      const syncReason = options.reason === AuthSessionChangeReason.EnterpriseMembershipRevoked
+        ? 'enterprise-membership-revoked-server-models-cleared'
+        : options.reason === AuthSessionChangeReason.RefreshRejected
+          ? 'auth-session-expired-server-models-cleared'
+          : 'auth-logout-server-models-cleared';
       syncOpenClawConfig({
         reason: syncReason,
         restartGatewayIfRunning: false,
@@ -5692,8 +6632,6 @@ if (!gotTheLock) {
 
   registerActivityIpcHandlers({
     ipcMain,
-    isDev,
-    isPackaged: app.isPackaged,
     getMainWindow: () => mainWindow,
     getServerBaseUrl: getServerApiBaseUrl,
     getClientVersion: () => app.getVersion(),
@@ -5701,10 +6639,29 @@ if (!gotTheLock) {
     hasAuthTokens: () => getAuthTokens() !== null,
     fetchPublic: (url, options) => net.fetch(url, options),
     fetchWithAuth,
-    developmentServerBaseUrl: process.env.LOBSTER_ACTIVITY_SERVER_BASE_URL,
   });
 
   ipcMain.handle(AuthIpcChannel.Exchange, async (_event, { code }: { code: string }) => {
+    const startingTokens = getAuthTokens();
+    const startingUser = getAuthUser();
+    const startingEnterpriseContext = getPersistedEnterpriseAccountContext(getStore());
+    const startingQuotaGateState = getAuthQuotaGateState();
+    const startingServerModels = getAllServerModelMetadata();
+    const exchangeIntent: AuthExchangeIntentSnapshot = {
+      intentId: ++authExchangeIntentSequence,
+      accountGeneration: authAccountGeneration,
+      accessToken: startingTokens?.accessToken ?? null,
+      refreshToken: startingTokens?.refreshToken ?? null,
+    };
+    activeAuthExchangeIntent = exchangeIntent;
+    const isExchangeIntentCurrent = (): boolean => isAuthExchangeIntentCurrent(
+      exchangeIntent,
+      activeAuthExchangeIntent?.intentId ?? null,
+      authAccountGeneration,
+      getAuthTokens(),
+    );
+    let committedExchangeGeneration: number | null = null;
+
     try {
       const serverBaseUrl = getServerApiBaseUrl();
       const exchangeUrl = `${serverBaseUrl}/api/auth/exchange`;
@@ -5730,23 +6687,115 @@ if (!gotTheLock) {
       if (body.code !== 0 || !body.data) {
         return { success: false, error: body.message || 'Exchange failed' };
       }
+      if (!isExchangeIntentCurrent()) {
+        return { success: false, error: t('authAccountChanged') };
+      }
+
+      const previousAccountScope = getCurrentMediaAccountScope();
+      activeAuthExchangeIntent = null;
+      authAccountGeneration += 1;
+      const exchangeAccountGeneration = authAccountGeneration;
+      clearEnterpriseAccountContext(getStore());
+      clearServerModelMetadata();
+      // A login exchange can switch accounts without an explicit logout.
+      // Reset entitlement fallbacks before normalizing the new account so a
+      // partial quota payload cannot inherit the previous account's plan.
+      resetAuthQuotaGateState();
       saveAuthTokens(body.data.accessToken, body.data.refreshToken);
       saveAuthUser(body.data.user);
-      console.log('[Auth] exchange user data:', JSON.stringify(body.data.user));
-      const previousQuotaGateState = getAuthQuotaGateState();
+      committedExchangeGeneration = exchangeAccountGeneration;
+      const enterpriseContext = await syncEnterpriseAccountContextFromPayload(body.data);
+      const requiresEnterpriseContext = (
+        readAccountMode(body.data) === EnterpriseAccountMode.Enterprise
+        || body.data.quota.subscriptionStatus === AuthSubscriptionStatus.Enterprise
+      );
+      if (requiresEnterpriseContext && !enterpriseContext) {
+        throw new Error('Enterprise account context was unavailable after token exchange');
+      }
+      if (
+        authAccountGeneration !== exchangeAccountGeneration
+        || authExchangeIntentSequence !== exchangeIntent.intentId
+      ) {
+        return { success: false, error: t('authAccountChanged') };
+      }
+      mediaSelectionBySession.clear();
+      mediaTurnAccountScopeBySession.clear();
+      mediaReferencesBySession.clear();
+      if (previousAccountScope) {
+        clearMediaPollingStateForOwner(previousAccountScope.ownerAccountKey);
+      }
+      if (pendingMediaTasks.size === 0) {
+        stopMediaPollTimer();
+      }
+      console.log(
+        `[Auth] exchange completed; enterpriseContext=${enterpriseContext ? 'present' : 'absent'}`,
+      );
       const quota = normalizeQuota(body.data.quota);
-      syncOpenClawConfigIfAuthQuotaGateChanged(previousQuotaGateState);
-      return { success: true, user: body.data.user, quota };
+      syncOpenClawConfigIfAuthQuotaGateChanged(startingQuotaGateState);
+      return {
+        success: true,
+        user: body.data.user,
+        quota,
+        enterpriseContext,
+      };
     } catch (error) {
+      if (
+        committedExchangeGeneration !== null
+        && authAccountGeneration === committedExchangeGeneration
+        && authExchangeIntentSequence === exchangeIntent.intentId
+      ) {
+        authAccountGeneration += 1;
+        if (startingTokens) {
+          saveAuthTokens(startingTokens.accessToken, startingTokens.refreshToken);
+        } else {
+          clearAuthTokens();
+        }
+        if (startingUser) {
+          saveAuthUser(startingUser);
+        } else {
+          clearAuthUser();
+        }
+        if (startingEnterpriseContext) {
+          persistEnterpriseAccountContext(getStore(), startingEnterpriseContext);
+        } else {
+          clearEnterpriseAccountContext(getStore());
+        }
+        updateServerModelMetadata(startingServerModels);
+        cachedSubscriptionStatus = startingQuotaGateState.subscriptionStatus;
+        cachedMediaGenerationEntitled = startingQuotaGateState.mediaGenerationEntitled;
+        syncOpenClawConfig({
+          reason: 'auth-exchange-rollback',
+          restartGatewayIfRunning: false,
+        }).catch(syncError => {
+          console.warn('[Auth] failed to sync OpenClaw config after exchange rollback:', syncError);
+        });
+        console.warn('[Auth] rolled back local credentials after an incomplete exchange');
+      }
       console.error('[Auth] exchange failed:', error);
       return {
         success: false,
         error: error instanceof Error ? error.message : 'Exchange failed',
       };
+    } finally {
+      if (activeAuthExchangeIntent?.intentId === exchangeIntent.intentId) {
+        activeAuthExchangeIntent = null;
+      }
     }
   });
 
   ipcMain.handle(AuthIpcChannel.GetUser, async () => {
+    const createUnavailableResponse = () => {
+      const hasCredentials = Boolean(getAuthTokens());
+      return {
+        success: false,
+        status: hasCredentials
+          ? AuthSessionStatus.TemporarilyUnavailable
+          : AuthSessionStatus.Unauthenticated,
+        hasCredentials,
+        cachedUser: hasCredentials ? getAuthUser() : null,
+      };
+    };
+
     try {
       const tokens = getAuthTokens();
       if (!tokens) {
@@ -5756,9 +6805,14 @@ if (!gotTheLock) {
           hasCredentials: false,
         };
       }
+      const requestAccountGeneration = authAccountGeneration;
+      const requestAccountScope = getCurrentMediaAccountScope();
       const serverBaseUrl = getServerApiBaseUrl();
       // Fetch user profile
       const profileResp = await fetchWithAuth(`${serverBaseUrl}/api/user/profile`);
+      if (authAccountGeneration !== requestAccountGeneration) {
+        return createUnavailableResponse();
+      }
       if (!profileResp.ok) {
         return {
           success: false,
@@ -5767,10 +6821,17 @@ if (!gotTheLock) {
           cachedUser: getAuthUser(),
         };
       }
+      const profileResponseAuthState = captureAuthStateSnapshot();
       const profileBody = (await profileResp.json()) as {
         code: number;
         data: Record<string, unknown>;
       };
+      if (!isCurrentAuthStateSnapshot(profileResponseAuthState)) {
+        return createUnavailableResponse();
+      }
+      if (handleEnterpriseAccountContextMismatch(profileBody.code, requestAccountScope)) {
+        return createUnavailableResponse();
+      }
       if (profileBody.code !== 0 || !profileBody.data) {
         return {
           success: false,
@@ -5782,24 +6843,53 @@ if (!gotTheLock) {
       saveAuthUser(profileBody.data);
       // Fetch quota separately
       const quotaResp = await fetchWithAuth(`${serverBaseUrl}/api/user/quota`);
+      if (authAccountGeneration !== requestAccountGeneration) {
+        return createUnavailableResponse();
+      }
       let quota = null;
       if (quotaResp.ok) {
+        const quotaResponseAuthState = captureAuthStateSnapshot();
         const quotaBody = (await quotaResp.json()) as {
           code: number;
           data: Record<string, unknown>;
         };
+        if (!isCurrentAuthStateSnapshot(quotaResponseAuthState)) {
+          return createUnavailableResponse();
+        }
+        if (handleEnterpriseAccountContextMismatch(quotaBody.code, requestAccountScope)) {
+          return createUnavailableResponse();
+        }
         if (quotaBody.code === 0 && quotaBody.data) {
           const previousQuotaGateState = getAuthQuotaGateState();
           quota = normalizeQuota(quotaBody.data);
           syncOpenClawConfigIfAuthQuotaGateChanged(previousQuotaGateState);
         }
       }
-      console.log('[Auth] getUser profile data:', JSON.stringify(profileBody.data));
+      if (authAccountGeneration !== requestAccountGeneration) {
+        return createUnavailableResponse();
+      }
+      const enterpriseContext = await syncEnterpriseAccountContextFromPayload(profileBody.data);
+      if (authAccountGeneration !== requestAccountGeneration) {
+        return createUnavailableResponse();
+      }
+      const requiresEnterpriseContext = (
+        readAccountMode(profileBody.data) === EnterpriseAccountMode.Enterprise
+        || quota?.subscriptionStatus === AuthSubscriptionStatus.Enterprise
+      );
+      if (requiresEnterpriseContext && !enterpriseContext) {
+        console.warn('[Auth] enterprise account context was unavailable during profile refresh');
+        return createUnavailableResponse();
+      }
+      console.log(
+        `[Auth] profile refresh completed; quota=${quota ? 'present' : 'absent'}; `
+        + `enterpriseContext=${enterpriseContext ? 'present' : 'absent'}`,
+      );
       return {
         success: true,
         status: AuthSessionStatus.Authenticated,
         user: profileBody.data,
         quota,
+        enterpriseContext,
       };
     } catch (error) {
       const status = resolveAuthSessionStatusFromError(error);
@@ -5821,15 +6911,29 @@ if (!gotTheLock) {
     try {
       const tokens = getAuthTokens();
       if (!tokens) return { success: false };
+      const requestAccountGeneration = authAccountGeneration;
+      const requestAccountScope = getCurrentMediaAccountScope();
       const serverBaseUrl = getServerApiBaseUrl();
       const resp = await fetchWithAuth(`${serverBaseUrl}/api/user/quota`);
+      if (authAccountGeneration !== requestAccountGeneration) return { success: false };
       if (!resp.ok) return { success: false };
+      const responseAuthState = captureAuthStateSnapshot();
       const body = (await resp.json()) as { code: number; data: Record<string, unknown> };
+      if (!isCurrentAuthStateSnapshot(responseAuthState)) return { success: false };
+      if (handleEnterpriseAccountContextMismatch(body.code, requestAccountScope)) {
+        return { success: false };
+      }
       if (body.code !== 0 || !body.data) return { success: false };
       const previousQuotaGateState = getAuthQuotaGateState();
       const quota = normalizeQuota(body.data);
       syncOpenClawConfigIfAuthQuotaGateChanged(previousQuotaGateState);
-      return { success: true, quota };
+      const enterpriseContextResult = await refreshEnterpriseAccountContext();
+      if (authAccountGeneration !== requestAccountGeneration) return { success: false };
+      return {
+        success: true,
+        quota,
+        enterpriseContext: enterpriseContextResult.context,
+      };
     } catch {
       return { success: false };
     }
@@ -5839,12 +6943,31 @@ if (!gotTheLock) {
     try {
       const tokens = getAuthTokens();
       if (!tokens) return { success: false };
+      const requestAccountGeneration = authAccountGeneration;
+      const requestAccountScope = getCurrentMediaAccountScope();
+      if (requestAccountScope === null) return { success: false };
       const serverBaseUrl = getServerApiBaseUrl();
       const profileSummaryUrl = appendKeyfromQuery(`${serverBaseUrl}/api/user/profile-summary`);
       console.log(`[Auth] requesting profile summary at ${profileSummaryUrl}`);
       const resp = await fetchWithAuth(profileSummaryUrl);
+      if (
+        authAccountGeneration !== requestAccountGeneration
+        || !isMediaAccountScopeCurrent(requestAccountScope, getCurrentMediaAccountScope())
+      ) {
+        return { success: false };
+      }
       if (!resp.ok) return { success: false };
+      const responseAuthState = captureAuthStateSnapshot();
       const body = (await resp.json()) as { code: number; data: Record<string, unknown> };
+      if (
+        !isCurrentAuthStateSnapshot(responseAuthState)
+        || !isMediaAccountScopeCurrent(requestAccountScope, getCurrentMediaAccountScope())
+      ) {
+        return { success: false };
+      }
+      if (handleEnterpriseAccountContextMismatch(body.code, requestAccountScope)) {
+        return { success: false };
+      }
       if (body.code !== 0 || !body.data) return { success: false };
       return { success: true, data: body.data };
     } catch {
@@ -5909,39 +7032,34 @@ if (!gotTheLock) {
   });
 
   ipcMain.handle(AuthIpcChannel.Logout, async () => {
-    try {
-      const tokens = getAuthTokens();
-      if (tokens) {
+    const tokens = getAuthTokens();
+    const enterpriseHeaders = getEnterpriseAccountHeaders();
+    const logoutBody = JSON.stringify(withKeyfromBody({}));
+    clearLocalAuthSession({
+      reason: AuthSessionChangeReason.UserLogout,
+      notifyRenderer: false,
+    });
+    console.log('[Auth] cleared local login state and scheduled server model config refresh');
+
+    if (tokens) {
+      try {
         const serverBaseUrl = getServerApiBaseUrl();
         const logoutUrl = `${serverBaseUrl}/api/auth/logout`;
         console.log(`[Auth] requesting logout at ${logoutUrl}`);
-        await net
-          .fetch(logoutUrl, {
-            method: 'POST',
-            headers: {
-              Authorization: `Bearer ${tokens.accessToken}`,
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify(withKeyfromBody({})),
-          })
-          .catch(() => {
-            /* best-effort */
-          });
+        await net.fetch(logoutUrl, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${tokens.accessToken}`,
+            'Content-Type': 'application/json',
+            ...enterpriseHeaders,
+          },
+          body: logoutBody,
+        });
+      } catch (error) {
+        console.warn('[Auth] remote logout failed after local credentials were cleared:', error);
       }
-      clearLocalAuthSession({
-        reason: AuthSessionChangeReason.UserLogout,
-        notifyRenderer: false,
-      });
-      console.log('[Auth] cleared login state and scheduled server model config refresh');
-      return { success: true };
-    } catch (error) {
-      console.warn('[Auth] logout cleanup encountered an error; clearing local state anyway:', error);
-      clearLocalAuthSession({
-        reason: AuthSessionChangeReason.UserLogout,
-        notifyRenderer: false,
-      });
-      return { success: true };
     }
+    return { success: true };
   });
 
   ipcMain.handle(AuthIpcChannel.RefreshToken, async () => {
@@ -6021,6 +7139,7 @@ if (!gotTheLock) {
   ipcMain.handle(HtmlShareIpc.CreateFromHtmlFile, async (_event, input: unknown) => {
     let archivePath: string | undefined;
     try {
+      const { scopedFetch } = capturePublishingRequest();
       const options = sanitizeCreateFromHtmlFileInput(input);
       console.debug(
         `[HtmlShare] received HTML file share request for session ${options.sessionId} and artifact ${options.artifactId}`,
@@ -6037,7 +7156,7 @@ if (!gotTheLock) {
       const result = await uploadHtmlShare(
         getServerApiBaseUrl(),
         getHtmlSharePublicBaseUrl(),
-        fetchWithAuth,
+        scopedFetch,
         {
           archivePath: packaged.archivePath,
           sourceType: HtmlShareSourceType.HtmlFile,
@@ -6099,6 +7218,7 @@ if (!gotTheLock) {
   ipcMain.handle(HtmlShareIpc.UpdateFromHtmlFile, async (_event, input: unknown) => {
     let archivePath: string | undefined;
     try {
+      const { scopedFetch } = capturePublishingRequest();
       const options = sanitizeUpdateFromHtmlFileInput(input);
       const clientSourceKey = buildHtmlShareClientSourceKey(options.filePath);
       const packaged = await packageHtmlFile(options.filePath);
@@ -6106,7 +7226,7 @@ if (!gotTheLock) {
       const result = await updateHtmlShare(
         getServerApiBaseUrl(),
         getHtmlSharePublicBaseUrl(),
-        fetchWithAuth,
+        scopedFetch,
         options.shareId,
         {
           archivePath: packaged.archivePath,
@@ -6146,6 +7266,7 @@ if (!gotTheLock) {
   ipcMain.handle(HtmlShareIpc.CreateFromArtifactFile, async (_event, input: unknown) => {
     let archivePath: string | undefined;
     try {
+      const { scopedFetch } = capturePublishingRequest();
       const options = sanitizeCreateFromArtifactFileInput(input);
       console.debug(
         `[HtmlShare] received ${options.sourceType} share request for session ${options.sessionId} and artifact ${options.artifactId}`,
@@ -6165,7 +7286,7 @@ if (!gotTheLock) {
       const result = await uploadHtmlShare(
         getServerApiBaseUrl(),
         getHtmlSharePublicBaseUrl(),
-        fetchWithAuth,
+        scopedFetch,
         {
           archivePath: packaged.archivePath,
           sourceType: options.sourceType,
@@ -6224,6 +7345,7 @@ if (!gotTheLock) {
   ipcMain.handle(HtmlShareIpc.UpdateFromArtifactFile, async (_event, input: unknown) => {
     let archivePath: string | undefined;
     try {
+      const { scopedFetch } = capturePublishingRequest();
       const options = sanitizeUpdateFromArtifactFileInput(input);
       const clientSourceKey = buildArtifactShareClientSourceKey(options);
       const packaged = await packageArtifactFile({
@@ -6237,7 +7359,7 @@ if (!gotTheLock) {
       const result = await updateHtmlShare(
         getServerApiBaseUrl(),
         getHtmlSharePublicBaseUrl(),
-        fetchWithAuth,
+        scopedFetch,
         options.shareId,
         {
           archivePath: packaged.archivePath,
@@ -6441,6 +7563,7 @@ if (!gotTheLock) {
   ipcMain.handle(ShareDeploymentIpc.CreateNodeDeployment, async (_event, input: unknown) => {
     let archivePath: string | undefined;
     try {
+      const { accountScope, scopedFetch } = capturePublishingRequest();
       const options = sanitizeShareDeploymentCreateNodeInput(input);
       const operationSourceKey = buildNodeDeploymentClientSourceKey({
         sessionId: options.sessionId,
@@ -6450,7 +7573,8 @@ if (!gotTheLock) {
       console.debug(
         `[ShareDeployment] received node deployment request for session ${options.sessionId} and artifact ${options.artifactId}`,
       );
-      return await shareDeploymentOperationCoordinator.run(operationSourceKey, async () => {
+      const accountOperationKey = `${accountScope.ownerAccountKey}:${operationSourceKey}`;
+      return await shareDeploymentOperationCoordinator.run(accountOperationKey, async () => {
         const packaged = await packageNodeServiceDeployment({
           projectDirectory: options.projectDirectory,
           localServiceUrl: options.localServiceUrl,
@@ -6481,7 +7605,7 @@ if (!gotTheLock) {
           ? await uploadStaticDeployment(
               serverBaseUrl,
               publicBaseUrl,
-              fetchWithAuth,
+              scopedFetch,
               {
                 ...options,
                 archivePath: packaged.archivePath,
@@ -6497,7 +7621,7 @@ if (!gotTheLock) {
           : await uploadNodeDeployment(
               serverBaseUrl,
               publicBaseUrl,
-              fetchWithAuth,
+              scopedFetch,
               {
                 ...options,
                 archivePath: packaged.archivePath,
@@ -6521,14 +7645,14 @@ if (!gotTheLock) {
               updateAccessMode: (shareId, accessMode) => updateHtmlShareAccessMode(
                 serverBaseUrl,
                 publicBaseUrl,
-                fetchWithAuth,
+                scopedFetch,
                 shareId,
                 accessMode,
               ),
               updateStatus: (shareId, status) => updateHtmlShareStatus(
                 serverBaseUrl,
                 publicBaseUrl,
-                fetchWithAuth,
+                scopedFetch,
                 shareId,
                 status,
               ),
@@ -6634,18 +7758,29 @@ if (!gotTheLock) {
   });
 
   // Media generation IPC handlers
-  ipcMain.handle('media:getModels', async (_event, type: 'image' | 'video') => {
+  ipcMain.handle(CoworkIpcChannel.GetMediaModels, async (_event, type: 'image' | 'video') => {
     try {
+      if (type !== 'image' && type !== 'video') {
+        console.warn('[Media:getModels] rejected invalid media type');
+        return { success: false, error: 'Invalid media type' };
+      }
       const tokens = getAuthTokens();
-      if (!tokens) {
+      const requestAccountScope = getCurrentMediaAccountScope();
+      if (!tokens || requestAccountScope === null) {
         console.warn('[Media:getModels] No auth tokens, skipping');
-        return { success: false, error: 'Not logged in' };
+        return { success: false, error: t('authLoginRequired') };
       }
       const serverBaseUrl = getServerApiBaseUrl();
       const endpoint = type === 'image' ? '/api/media/images/models' : '/api/media/videos/models';
       const resp = await fetchWithAuth(`${serverBaseUrl}${endpoint}`);
-      if (!resp.ok) return { success: false, error: `HTTP ${resp.status}` };
       const body = await resp.json() as { code: number; data?: unknown[]; message?: string };
+      if (!isMediaAccountScopeCurrent(requestAccountScope, getCurrentMediaAccountScope())) {
+        return { success: false, error: t('authAccountChanged') };
+      }
+      if (handleEnterpriseAccountContextMismatch(body.code, requestAccountScope)) {
+        return { success: false, error: t('enterpriseAccountContextMismatchMessage') };
+      }
+      if (!resp.ok) return { success: false, error: body.message || `HTTP ${resp.status}` };
       if (body.code !== 0) return { success: false, error: body.message };
       const models = (body.data || []).map(model => {
         const mediaModel = model as { modelId?: string; displayName?: string };
@@ -6665,18 +7800,45 @@ if (!gotTheLock) {
 
   ipcMain.handle('media:getTaskStatus', async (_event, taskId: number, type: 'image' | 'video') => {
     try {
+      if (type !== 'image' && type !== 'video') {
+        console.warn('[Media:getTaskStatus] rejected invalid media type');
+        return { success: false, error: 'Invalid media type' };
+      }
       const tokens = getAuthTokens();
-      if (!tokens) return { success: false, error: 'Not logged in' };
+      const requestAccountScope = getCurrentMediaAccountScope();
+      if (!tokens || requestAccountScope === null) {
+        return { success: false, error: t('authLoginRequired') };
+      }
+      const taskOwnerAccountKey = resolveMediaTaskOwner(taskId);
+      if (!canAccessTrackedMediaTask(taskOwnerAccountKey, requestAccountScope)) {
+        return { success: false, error: t('mediaTaskAccountMismatch') };
+      }
       const serverBaseUrl = getServerApiBaseUrl();
       const mediaPath = type === 'image' ? 'images' : 'videos';
       const taskUrl = `${serverBaseUrl}/api/media/${mediaPath}/tasks/${taskId}`;
-      console.log('[Media:getTaskStatus] Fetching:', taskUrl);
+      console.debug(`[Media:getTaskStatus] requesting ${type} task ${taskId}`);
       const resp = await fetchWithAuth(taskUrl);
-      console.log('[Media:getTaskStatus] Response status:', resp.status);
-      if (!resp.ok) return { success: false, error: `HTTP ${resp.status}` };
       const body = await resp.json() as { code: number; data?: unknown; message?: string };
-      console.log('[Media:getTaskStatus] Response body:', JSON.stringify(body));
+      const responseTask = body.data && typeof body.data === 'object'
+        ? body.data as Record<string, unknown>
+        : null;
+      console.debug(
+        `[Media:getTaskStatus] response HTTP ${resp.status}; code=${body.code}; status=${String(responseTask?.status ?? 'unknown')}`,
+      );
+      if (!isMediaAccountScopeCurrent(requestAccountScope, getCurrentMediaAccountScope())) {
+        return { success: false, error: t('authAccountChanged') };
+      }
+      if (handleEnterpriseAccountContextMismatch(body.code, requestAccountScope)) {
+        return { success: false, error: t('enterpriseAccountContextMismatchMessage') };
+      }
+      if (!resp.ok) return { success: false, error: body.message || `HTTP ${resp.status}` };
       if (body.code !== 0) return { success: false, error: body.message };
+      const task = body.data as Record<string, unknown> | undefined;
+      rememberMediaTaskOwnership(
+        requestAccountScope.ownerAccountKey,
+        task?.taskId,
+        task?.upstreamTaskId,
+      );
       return { success: true, task: body.data };
     } catch (e) {
       console.error('[Media:getTaskStatus] Error:', e);
@@ -7142,6 +8304,7 @@ if (!gotTheLock) {
         imageAttachments?: CoworkImageAttachmentMain[];
         agentId?: string;
         modelOverride?: string;
+        thinkingLevel?: string;
         mediaSelection?: {
           mode: 'auto' | 'image' | 'video' | 'none';
           modelId?: string;
@@ -7156,6 +8319,7 @@ if (!gotTheLock) {
     ) => {
       try {
         const ipcStartedAtMs = Date.now();
+        const requestAccountScope = getCurrentMediaAccountScope();
         console.log(
           '[CoworkFirstResponseTiming] start IPC received.',
           `Prompt length ${options.prompt.length}.`,
@@ -7174,6 +8338,15 @@ if (!gotTheLock) {
         const engineStatus = await ensureOpenClawRunningForCowork();
         if (engineStatus.phase !== 'running') {
           return getEngineNotReadyResponse(engineStatus);
+        }
+        if (!isMediaAccountScopeSnapshotCurrent(
+          requestAccountScope,
+          getCurrentMediaAccountScope(),
+        )) {
+          return {
+            success: false,
+            error: t('authAccountChanged'),
+          };
         }
 
         const coworkStoreInstance = getCoworkStore();
@@ -7213,6 +8386,12 @@ if (!gotTheLock) {
         const runtimeSkillIds = options.runtimeSkillIds ?? options.activeSkillIds;
         const selectedTextSnippets = normalizeSelectedTextSnippetsForIpc(options.selectedTextSnippets);
         const browserAnnotations = normalizeBrowserAnnotationBatches(options.browserAnnotations);
+        const thinkingLevel = options.thinkingLevel === undefined
+          ? ''
+          : parseModelThinkingLevel(options.thinkingLevel);
+        if (options.thinkingLevel !== undefined && !thinkingLevel) {
+          return { success: false, error: 'Unsupported session thinking level.' };
+        }
         if (selectedTextSnippets.length > 0) {
           console.log(
             `[CoworkSelectedText] accepted ${selectedTextSnippets.length} excerpts with `
@@ -7228,6 +8407,7 @@ if (!gotTheLock) {
           runtimeSkillIds || [],
           options.agentId || 'main',
           options.modelOverride || '',
+          { thinkingLevel: thinkingLevel || '' },
         );
 
         if (options.modelOverride) {
@@ -7245,8 +8425,20 @@ if (!gotTheLock) {
           mediaGenerationEntitled: cachedMediaGenerationEntitled,
         });
         const { workflowKind, mediaSelection: normalizedMediaSelection } = skinTurn;
-        if (normalizedMediaSelection && normalizedMediaSelection.mode !== 'none') {
-          mediaSelectionBySession.set(session.id, normalizedMediaSelection);
+        if (requestAccountScope) {
+          mediaTurnAccountScopeBySession.set(session.id, requestAccountScope);
+        } else {
+          mediaTurnAccountScopeBySession.delete(session.id);
+        }
+        if (
+          requestAccountScope
+          && normalizedMediaSelection
+          && normalizedMediaSelection.mode !== 'none'
+        ) {
+          mediaSelectionBySession.set(
+            session.id,
+            bindAccountValue(normalizedMediaSelection, requestAccountScope),
+          );
         } else {
           mediaSelectionBySession.delete(session.id);
         }
@@ -7375,6 +8567,7 @@ if (!gotTheLock) {
     ) => {
       try {
         const ipcStartedAtMs = Date.now();
+        const requestAccountScope = getCurrentMediaAccountScope();
         console.log(
           '[CoworkFirstResponseTiming] continue IPC received.',
           `Session ${options.sessionId}.`,
@@ -7390,6 +8583,15 @@ if (!gotTheLock) {
         const engineStatus = await ensureOpenClawRunningForCowork();
         if (engineStatus.phase !== 'running') {
           return getEngineNotReadyResponse(engineStatus);
+        }
+        if (!isMediaAccountScopeSnapshotCurrent(
+          requestAccountScope,
+          getCurrentMediaAccountScope(),
+        )) {
+          return {
+            success: false,
+            error: t('authAccountChanged'),
+          };
         }
 
         const runtime = getCoworkEngineRouter();
@@ -7432,8 +8634,20 @@ if (!gotTheLock) {
           mediaGenerationEntitled: cachedMediaGenerationEntitled,
         });
         const { workflowKind, mediaSelection: normalizedMediaSelection } = skinTurn;
-        if (normalizedMediaSelection && normalizedMediaSelection.mode !== 'none') {
-          mediaSelectionBySession.set(options.sessionId, normalizedMediaSelection);
+        if (requestAccountScope) {
+          mediaTurnAccountScopeBySession.set(options.sessionId, requestAccountScope);
+        } else {
+          mediaTurnAccountScopeBySession.delete(options.sessionId);
+        }
+        if (
+          requestAccountScope
+          && normalizedMediaSelection
+          && normalizedMediaSelection.mode !== 'none'
+        ) {
+          mediaSelectionBySession.set(
+            options.sessionId,
+            bindAccountValue(normalizedMediaSelection, requestAccountScope),
+          );
         } else {
           mediaSelectionBySession.delete(options.sessionId);
         }
@@ -7654,6 +8868,7 @@ if (!gotTheLock) {
       ? options.clientSteerId.trim()
       : `steer-${Date.now()}`;
     try {
+      const requestAccountScope = getCurrentMediaAccountScope();
       const sessionId = typeof options?.sessionId === 'string' ? options.sessionId.trim() : '';
       const text = typeof options?.text === 'string' ? options.text.trim() : '';
       if (!sessionId || !text) {
@@ -7663,6 +8878,19 @@ if (!gotTheLock) {
           clientSteerId,
           reason: CoworkSteerRejectReason.EmptyInput,
           error: 'Session id and steer input are required.',
+        };
+      }
+      const requestTurnAccountScope = resolveMediaTurnAccountScopeForSession(sessionId);
+      if (!isMediaAccountScopeSnapshotCurrent(
+        requestAccountScope,
+        requestTurnAccountScope,
+      )) {
+        return {
+          success: false,
+          status: CoworkSteerStatus.Rejected,
+          clientSteerId,
+          reason: CoworkSteerRejectReason.RuntimeRejected,
+          error: t('mediaTaskAccountMismatch'),
         };
       }
       console.debug(
@@ -7681,6 +8909,24 @@ if (!gotTheLock) {
           reason: CoworkSteerRejectReason.RuntimeRejected,
         };
       }
+      if (
+        !isMediaAccountScopeSnapshotCurrent(
+          requestAccountScope,
+          getCurrentMediaAccountScope(),
+        )
+        || !isMediaAccountScopeSnapshotCurrent(
+          requestTurnAccountScope,
+          resolveMediaTurnAccountScopeForSession(sessionId),
+        )
+      ) {
+        return {
+          success: false,
+          status: CoworkSteerStatus.Rejected,
+          clientSteerId,
+          reason: CoworkSteerRejectReason.RuntimeRejected,
+          error: t('authAccountChanged'),
+        };
+      }
 
       const runtime = getCoworkEngineRouter();
       if (!runtime.submitSteer) {
@@ -7694,6 +8940,18 @@ if (!gotTheLock) {
       }
 
       const result = await runtime.submitSteer(sessionId, text, clientSteerId);
+      if (!isMediaAccountScopeSnapshotCurrent(
+        requestAccountScope,
+        getCurrentMediaAccountScope(),
+      )) {
+        return {
+          success: false,
+          status: CoworkSteerStatus.Rejected,
+          clientSteerId,
+          reason: CoworkSteerRejectReason.RuntimeRejected,
+          error: t('authAccountChanged'),
+        };
+      }
       console.debug(
         '[CoworkSteer] steer IPC completed.',
         `Session ${sessionId}.`,
@@ -7817,6 +9075,7 @@ if (!gotTheLock) {
       const coworkStoreInstance = getCoworkStore();
       coworkStoreInstance.deleteSession(sessionId);
       mediaSelectionBySession.delete(sessionId);
+      mediaTurnAccountScopeBySession.delete(sessionId);
       skinRuntimeController?.handleSessionDeleted(sessionId);
       mediaReferencesBySession.delete(sessionId);
       getDesktopNotificationManager().handleSessionDeleted(sessionId);
@@ -7824,9 +9083,7 @@ if (!gotTheLock) {
       for (const [taskId, tracker] of pendingMediaTasks) {
         if (tracker.sessionId === sessionId) pendingMediaTasks.delete(taskId);
       }
-      for (const key of mediaTasksHandledByStatusPolling) {
-        if (key.startsWith(`${sessionId}:`)) mediaTasksHandledByStatusPolling.delete(key);
-      }
+      clearHandledMediaTasksForSession(sessionId);
       clearMediaStatusPollCountsForSession(sessionId);
       // Clean up IM session mapping so that new channel messages
       // create a fresh session instead of referencing a deleted one.
@@ -8062,7 +9319,11 @@ if (!gotTheLock) {
 
   ipcMain.handle(
     'cowork:session:getMessages',
-    async (_event, options: { sessionId: string; limit?: number; offset?: number }) => {
+    async (_event, options: {
+      sessionId: string;
+      limit?: number;
+      offset?: number;
+    }) => {
       try {
         const { sessionId, limit = COWORK_MESSAGE_PAGE_SIZE, offset = 0 } = options;
         const store = getCoworkStore();
@@ -8076,6 +9337,47 @@ if (!gotTheLock) {
         return {
           success: false,
           error: error instanceof Error ? error.message : 'Failed to get session messages',
+        };
+      }
+    },
+  );
+
+  ipcMain.handle(
+    CoworkIpcChannel.GetSessionSearchMessages,
+    async (_event, options: {
+      sessionId: string;
+      limit?: number;
+      offset?: number;
+      cursor?: CoworkSearchMessageCursor;
+      knownTotal?: number;
+    }) => {
+      try {
+        const requestedLimit = options?.limit ?? COWORK_SEARCH_MESSAGE_PAGE_SIZE;
+        const limit = Number.isFinite(requestedLimit)
+          ? Math.max(1, Math.min(COWORK_SEARCH_MESSAGE_PAGE_MAX_SIZE, Math.floor(requestedLimit)))
+          : COWORK_SEARCH_MESSAGE_PAGE_SIZE;
+        const requestedOffset = options?.offset ?? 0;
+        const offset = Number.isFinite(requestedOffset)
+          ? Math.max(0, Math.floor(requestedOffset))
+          : 0;
+        const page = getCoworkStore().getSessionSearchMessagePage(
+          options.sessionId,
+          limit,
+          offset,
+          options.cursor,
+          options.knownTotal,
+        );
+        console.debug(
+          `[CoworkIPC] loaded lightweight search page for session ${options.sessionId}; `
+          + `returned ${page.messages.length} searchable messages while advancing `
+          + `from offset ${page.offset} to ${page.nextOffset} of ${page.total}.`,
+        );
+        return { success: true, ...page };
+      } catch (error) {
+        console.error('[CoworkIPC] failed to load lightweight conversation search page:', error);
+        return {
+          success: false,
+          error: error instanceof Error ? error.message : 'Failed to get conversation search messages',
         };
       }
     },
@@ -8302,11 +9604,25 @@ if (!gotTheLock) {
     getCoworkEngineRouter,
   });
 
-  ipcMain.handle('cowork:media:cancel', async (_event, taskId: string) => {
+  ipcMain.handle(CoworkIpcChannel.CancelMediaTask, async (_event, taskId: string) => {
     try {
+      const requestAccountScope = getCurrentMediaAccountScope();
+      if (requestAccountScope === null) {
+        return { success: false, message: t('authLoginRequired') };
+      }
+      const taskOwnerAccountKey = resolveMediaTaskOwner(taskId);
+      if (!canAccessTrackedMediaTask(taskOwnerAccountKey, requestAccountScope)) {
+        return { success: false, message: t('mediaTaskAccountMismatch') };
+      }
       const serverBaseUrl = getServerApiBaseUrl();
       const resp = await fetchWithAuth(`${serverBaseUrl}/api/media/videos/tasks/${taskId}/cancel`, { method: 'POST' });
       const body = await resp.json() as { code: number; message?: string };
+      if (!isMediaAccountScopeCurrent(requestAccountScope, getCurrentMediaAccountScope())) {
+        return { success: false, message: t('authAccountChanged') };
+      }
+      if (handleEnterpriseAccountContextMismatch(body.code, requestAccountScope)) {
+        return { success: false, message: t('enterpriseAccountContextMismatchMessage') };
+      }
       if (body.code === 0) {
         return { success: true };
       }
@@ -8461,18 +9777,23 @@ if (!gotTheLock) {
       const runtime = getCoworkEngineRouter();
       const patchResult = await runtime.patchSession(sessionId, patch);
 
-      if (patch.model !== undefined) {
-        const modelOverride =
-          patchResult && typeof patchResult.modelOverride === 'string'
-            ? patchResult.modelOverride
-            : patch.model ?? '';
-        getCoworkStore().updateSession(
-          sessionId,
-          {
-            modelOverride,
-          },
-          { touchUpdatedAt: false },
-        );
+      if (patch.model !== undefined || patch.thinkingLevel !== undefined) {
+        const sessionUpdates: {
+          modelOverride?: string;
+          thinkingLevel?: ReturnType<typeof parseModelThinkingLevel> | '';
+        } = {};
+        if (patch.model !== undefined) {
+          sessionUpdates.modelOverride =
+            patchResult && typeof patchResult.modelOverride === 'string'
+              ? patchResult.modelOverride
+              : patch.model ?? '';
+        }
+        if (patch.thinkingLevel !== undefined) {
+          sessionUpdates.thinkingLevel = patch.thinkingLevel
+            ? parseModelThinkingLevel(patch.thinkingLevel) ?? ''
+            : '';
+        }
+        getCoworkStore().updateSession(sessionId, sessionUpdates, { touchUpdatedAt: false });
       }
 
       const session = getCoworkStore().getSession(sessionId);
@@ -10400,6 +11721,7 @@ if (!gotTheLock) {
         const base64 = buffer.toString('base64');
         return { success: true, dataUrl: `data:${mimeType};base64,${base64}` };
       } catch (error) {
+        console.warn('[Dialog] failed to read file as data URL:', error);
         return {
           success: false,
           error: error instanceof Error ? error.message : 'Failed to read file',
@@ -10463,12 +11785,50 @@ if (!gotTheLock) {
           await handle.close();
         }
       } catch (error) {
+        console.warn('[Dialog] failed to read text file:', error);
         return {
           success: false,
           error: error instanceof Error ? error.message : 'Failed to read file',
         };
       }
     }
+  );
+
+  ipcMain.handle(
+    DialogIpc.SaveFileCopy,
+    async (
+      event,
+      filePath?: string,
+    ): Promise<{ success: boolean; canceled?: boolean; path?: string; error?: string }> => {
+      try {
+        if (typeof filePath !== 'string' || !filePath.trim()) {
+          return { success: false, error: 'Missing file path' };
+        }
+        const resolvedPath = path.resolve(filePath.trim());
+        const stat = await fs.promises.stat(resolvedPath);
+        if (!stat.isFile()) {
+          return { success: false, error: 'Not a file' };
+        }
+        const ownerWindow = BrowserWindow.fromWebContents(event.sender);
+        const saveOptions = {
+          defaultPath: path.join(app.getPath('downloads'), path.basename(resolvedPath)),
+        };
+        const saveResult = ownerWindow
+          ? await dialog.showSaveDialog(ownerWindow, saveOptions)
+          : await dialog.showSaveDialog(saveOptions);
+        if (saveResult.canceled || !saveResult.filePath) {
+          return { success: true, canceled: true };
+        }
+        await fs.promises.copyFile(resolvedPath, saveResult.filePath);
+        return { success: true, canceled: false, path: saveResult.filePath };
+      } catch (error) {
+        console.warn('[Dialog] failed to save file copy:', error);
+        return {
+          success: false,
+          error: error instanceof Error ? error.message : 'Failed to save file copy',
+        };
+      }
+    },
   );
 
   ipcMain.handle(
@@ -10723,7 +12083,10 @@ if (!gotTheLock) {
   });
 
   registerSiteIpcHandlers({
-    fetchWithAuth,
+    fetchWithAuth: (url, options) => {
+      const { scopedFetch } = capturePublishingRequest();
+      return scopedFetch(url, options);
+    },
     getServerApiBaseUrl,
   });
 
@@ -11241,6 +12604,8 @@ if (!gotTheLock) {
     }
     mainWindow = null;
     isOpenSessionFromNotificationReady = false;
+    hasRenderedFirstFrame = false;
+    pendingShowOnFirstFrame = false;
 
     const initialWindowState = resolveInitialAppWindowState(
       getStore().get(AppWindowStoreKey.State),
@@ -11250,6 +12615,8 @@ if (!gotTheLock) {
 
     mainWindow = new BrowserWindow({
       ...initialWindowBounds,
+      minWidth: MIN_APP_WINDOW_WIDTH,
+      minHeight: MIN_APP_WINDOW_HEIGHT,
       title: APP_NAME,
       icon: getAppIconPath(),
       ...(isMac
@@ -11357,19 +12724,71 @@ if (!gotTheLock) {
       mainWindow.maximize();
     }
 
-    // 设置窗口加载超时
-    const loadTimeout = setTimeout(() => {
-      if (mainWindow && mainWindow.webContents.isLoadingMainFrame()) {
-        console.log('Window load timed out, attempting to reload...');
-        scheduleReload('load-timeout');
+    const markFirstFrameRendered = (source: string) => {
+      hasRenderedFirstFrame = true;
+      if (pendingShowOnFirstFrame && mainWindow && !mainWindow.isDestroyed()) {
+        pendingShowOnFirstFrame = false;
+        focusMainWindow(`deferred activation (${source})`);
       }
-    }, 30000);
+    };
 
-    // 清除超时
-    mainWindow.webContents.once('did-finish-load', () => {
-      clearTimeout(loadTimeout);
-    });
+    // 窗口加载看门狗。一次性 30s 超时救不回被杀软扫描拖慢的首启动(现场案例:
+    // 首次加载超 30s,唯一一次 reload 后再无人接管,窗口永久空白),改为按退避
+    // 重试,封顶后停手保留现场。
+    const LOAD_WATCHDOG_DELAYS_MS = [30_000, 45_000, 60_000, 90_000];
+    let loadRecoveryAttempts = 0;
+    let loadWatchdogTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const clearLoadWatchdog = () => {
+      if (loadWatchdogTimer) {
+        clearTimeout(loadWatchdogTimer);
+        loadWatchdogTimer = null;
+      }
+    };
+
+    const scheduleLoadWatchdog = () => {
+      clearLoadWatchdog();
+      const delay = LOAD_WATCHDOG_DELAYS_MS[
+        Math.min(loadRecoveryAttempts, LOAD_WATCHDOG_DELAYS_MS.length - 1)
+      ];
+      loadWatchdogTimer = setTimeout(() => {
+        loadWatchdogTimer = null;
+        if (!mainWindow || mainWindow.isDestroyed()) return;
+        if (!mainWindow.webContents.isLoadingMainFrame()) return;
+        if (loadRecoveryAttempts >= LOAD_WATCHDOG_DELAYS_MS.length) {
+          console.error(
+            `[Main] window still not loaded after ${loadRecoveryAttempts} reload attempts, giving up`,
+          );
+          return;
+        }
+        loadRecoveryAttempts++;
+        console.warn(
+          `[Main] window load watchdog: still loading after ${delay}ms, reload attempt ${loadRecoveryAttempts}/${LOAD_WATCHDOG_DELAYS_MS.length}`,
+        );
+        scheduleReload('load-watchdog');
+        scheduleLoadWatchdog();
+      }, delay);
+    };
+    scheduleLoadWatchdog();
+
+    // 兜底显示:首帧迟迟不来时,宁可让用户看到纯背景色的窗口,也不能看起来
+    // "应用没打开"。开机自启保持仅托盘,不弹窗。
+    const SHOW_FALLBACK_DELAY_MS = 10_000;
+    const showFallbackTimer = setTimeout(() => {
+      if (!mainWindow || mainWindow.isDestroyed()) return;
+      if (mainWindow.isVisible() || hasRenderedFirstFrame) return;
+      if (isAutoLaunched()) return;
+      console.warn(
+        `[Main] window not ready after ${SHOW_FALLBACK_DELAY_MS}ms, showing it before first paint`,
+      );
+      pendingShowOnFirstFrame = false;
+      mainWindow.show();
+    }, SHOW_FALLBACK_DELAY_MS);
+
     mainWindow.webContents.on('did-finish-load', () => {
+      clearLoadWatchdog();
+      loadRecoveryAttempts = 0;
+      markFirstFrameRendered('did-finish-load');
       windowStatePersist.emitState();
       if (openClawEngineManager && !mainWindow?.isDestroyed()) {
         mainWindow.webContents.send(
@@ -11446,6 +12865,15 @@ if (!gotTheLock) {
           setTimeout(() => {
             scheduleReload('did-fail-load');
           }, 3000);
+        } else if (loadRecoveryAttempts < LOAD_WATCHDOG_DELAYS_MS.length) {
+          loadRecoveryAttempts++;
+          console.warn(
+            `[Main] retrying window load after failure (attempt ${loadRecoveryAttempts}/${LOAD_WATCHDOG_DELAYS_MS.length})`,
+          );
+          setTimeout(() => {
+            scheduleReload('did-fail-load');
+            scheduleLoadWatchdog();
+          }, 3_000);
         }
       },
     );
@@ -11458,6 +12886,8 @@ if (!gotTheLock) {
 
     // 当窗口关闭时，清除引用
     mainWindow.on('closed', () => {
+      clearLoadWatchdog();
+      clearTimeout(showFallbackTimer);
       windowStatePersist.cleanup();
       authCallbackRouter.markRendererUnavailable();
       isOpenSessionFromNotificationReady = false;
@@ -11468,10 +12898,12 @@ if (!gotTheLock) {
 
     // 等待内容加载完成后再显示窗口
     mainWindow.once('ready-to-show', () => {
+      clearTimeout(showFallbackTimer);
       // 开机自启时不显示窗口，仅显示托盘图标
       if (!isAutoLaunched()) {
         mainWindow?.show();
       }
+      markFirstFrameRendered('ready-to-show');
       // Initialize main-process i18n from stored language before creating UI elements.
       const initLang = getStore().get<{ language?: string }>('app_config')?.language;
       setLanguage(initLang === 'en' ? 'en' : 'zh');
@@ -11684,12 +13116,20 @@ if (!gotTheLock) {
     await new Promise(resolve => { setTimeout(resolve, 500); });
   };
 
+  // Read by the quit watchdog to report which cleanup step was in flight when
+  // it had to force-exit.
+  let currentAppCleanupStep = 'not-started';
+
   const runAppCleanup = async (reason = 'quit'): Promise<void> => {
+    const cleanupStartedAt = Date.now();
     console.log(`[Main] App cleanup started for ${reason}`);
-    destroyTray();
+    currentAppCleanupStep = 'sync-teardown';
     skillManager?.stopWatching();
     stopMediaPollTimer();
     pendingMediaTasks.clear();
+    mediaTaskOwnerById.clear();
+    mediaSelectionBySession.clear();
+    mediaTurnAccountScopeBySession.clear();
     mediaTasksHandledByStatusPolling.clear();
     mediaStatusPollCounts.clear();
 
@@ -11702,34 +13142,43 @@ if (!gotTheLock) {
       openClawRuntimeAdapter.disconnectGatewayClient();
     }
 
+    // Stop skill services.
+    currentAppCleanupStep = 'skill-services';
+    const skillServices = getSkillServiceManager();
+    await skillServices.stopAll();
+
+    // Stop all IM gateways gracefully.
+    if (imGatewayManager) {
+      currentAppCleanupStep = 'im-gateways';
+      await imGatewayManager.stopAll().catch(err => {
+        console.error('[IM Gateway] Error stopping gateways on quit:', err);
+      });
+    }
+
+    // Stop the gateway before closing the local HTTP proxies below: the
+    // gateway is their client, and closing a server first would leave it
+    // draining the gateway's keep-alive sockets.
+    if (openClawEngineManager) {
+      currentAppCleanupStep = 'openclaw-gateway';
+      await openClawEngineManager.stopGateway().catch(error => {
+        console.error('[OpenClaw] Failed to stop gateway on quit:', error);
+      });
+    }
+
+    currentAppCleanupStep = 'openai-compat-proxy';
     await stopCoworkOpenAICompatProxy().catch(error => {
       console.error('Failed to stop OpenAI compatibility proxy:', error);
     });
 
+    currentAppCleanupStep = 'html-preview-server';
     await stopHtmlPreviewServer().catch(error => {
       console.error('[HtmlPreviewServer] Failed to stop:', error);
     });
 
     stopOpenClawTokenProxy();
 
-    // Stop skill services.
-    const skillServices = getSkillServiceManager();
-    await skillServices.stopAll();
-
-    // Stop all IM gateways gracefully.
-    if (imGatewayManager) {
-      await imGatewayManager.stopAll().catch(err => {
-        console.error('[IM Gateway] Error stopping gateways on quit:', err);
-      });
-    }
-
-    if (openClawEngineManager) {
-      await openClawEngineManager.stopGateway().catch(error => {
-        console.error('[OpenClaw] Failed to stop gateway on quit:', error);
-      });
-    }
-
     // Stop the cron job polling
+    currentAppCleanupStep = 'cron-and-store';
     try {
       getCronJobService().stopPolling();
     } catch {
@@ -11744,6 +13193,42 @@ if (!gotTheLock) {
     } catch {
       // Store may not have been initialized — safe to ignore.
     }
+
+    // Destroyed last so the tray icon keeps reflecting that the process is
+    // still alive while cleanup runs; destroying it first made a hung cleanup
+    // look like a finished exit while the process lived on invisibly.
+    destroyTray();
+    currentAppCleanupStep = 'done';
+    console.log(`[Main] App cleanup finished for ${reason} in ${Date.now() - cleanupStartedAt}ms`);
+  };
+
+  // Hard ceiling for graceful cleanup. Past this the process force-exits and
+  // logs the step that was still in flight: a hung await here used to leave an
+  // invisible zombie (tray destroyed, no window) that only Task Manager could
+  // kill — and that zombie is what the installer later has to hunt down.
+  const APP_CLEANUP_WATCHDOG_MS = 10_000;
+
+  const runAppCleanupAndExit = (trigger: string) => {
+    isCleanupInProgress = true;
+    isQuitting = true;
+
+    const watchdog = setTimeout(() => {
+      console.error(
+        `[Main] App cleanup did not finish within ${APP_CLEANUP_WATCHDOG_MS}ms (trigger=${trigger}, stuck at step: ${currentAppCleanupStep}), forcing exit`,
+      );
+      app.exit(1);
+    }, APP_CLEANUP_WATCHDOG_MS);
+
+    void runAppCleanup()
+      .catch(error => {
+        console.error(`[Main] Cleanup error (trigger=${trigger}):`, error);
+      })
+      .finally(() => {
+        clearTimeout(watchdog);
+        isCleanupFinished = true;
+        isCleanupInProgress = false;
+        app.exit(0);
+      });
   };
 
   app.on('before-quit', e => {
@@ -11754,18 +13239,7 @@ if (!gotTheLock) {
       return;
     }
 
-    isCleanupInProgress = true;
-    isQuitting = true;
-
-    void runAppCleanup()
-      .catch(error => {
-        console.error('[Main] Cleanup error:', error);
-      })
-      .finally(() => {
-        isCleanupFinished = true;
-        isCleanupInProgress = false;
-        app.exit(0);
-      });
+    runAppCleanupAndExit('before-quit');
   });
 
   const handleTerminationSignal = (signal: NodeJS.Signals) => {
@@ -11773,17 +13247,7 @@ if (!gotTheLock) {
       return;
     }
     console.log(`[Main] Received ${signal}, running cleanup before exit...`);
-    isCleanupInProgress = true;
-    isQuitting = true;
-    void runAppCleanup()
-      .catch(error => {
-        console.error(`[Main] Cleanup error during ${signal}:`, error);
-      })
-      .finally(() => {
-        isCleanupFinished = true;
-        isCleanupInProgress = false;
-        app.exit(0);
-      });
+    runAppCleanupAndExit(signal);
   };
 
   process.once('SIGINT', () => handleTerminationSignal('SIGINT'));
@@ -11925,7 +13389,16 @@ if (!gotTheLock) {
         getAuthTokens,
         refreshToken: reason => authSessionManager.refresh(reason),
         getServerBaseUrl: getServerApiBaseUrl,
+        getAccountContextHeaders: getEnterpriseAccountHeaders,
+        getSessionKey: getAuthSessionKey,
         getClientVersion: () => app.getVersion(),
+        getEnterpriseAuthSessionSnapshot: captureEnterpriseAuthSessionSnapshot,
+        onEnterpriseMembershipRevoked: event => {
+          handleEnterpriseMembershipRevocation({
+            ...event,
+            source: EnterpriseMembershipRevocationSource.LlmSse,
+          });
+        },
       });
       console.log('[Main] OpenClaw token proxy started');
     } catch (err) {
@@ -12093,6 +13566,13 @@ if (!gotTheLock) {
     } catch (err) {
       console.warn('[OpenClaw] main agent workspace migration failed (non-fatal):', err);
     }
+
+    // An interrupted Windows installer can leave an empty resources/cfmind
+    // directory plus win-resources.tar. Recover it before config sync because
+    // legacy plugins.installs migration needs the bundled OpenClaw CLI.
+    profiler.mark('prepareOpenClawRuntime');
+    await getOpenClawEngineManager().prepareRuntimeForStartupConfigSync();
+    profiler.measure('prepareOpenClawRuntime');
 
     profiler.mark('syncOpenClawConfig');
     const startupSync = await syncOpenClawConfig({

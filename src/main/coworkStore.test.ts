@@ -22,7 +22,12 @@ import BetterSqlite3 from 'better-sqlite3';
 
 import { CoworkSystemMessageKind } from '../common/coworkSystemMessages';
 import { AgentAvatarSvg, DefaultAgentAvatarIcon, encodeAgentAvatarIcon } from '../shared/agent/avatar';
-import { CoworkForkMode } from '../shared/cowork/constants';
+import {
+  COWORK_SEARCH_HISTORY_MAX_MESSAGE_CONTENT_CODE_UNITS,
+  COWORK_SEARCH_MESSAGE_PAGE_MAX_CONTENT_BYTES,
+  CoworkForkMode,
+} from '../shared/cowork/constants';
+import { OpenClawCronRunMetadataKey } from '../shared/cowork/openclawCronSessionKey';
 import { CoworkStore } from './coworkStore';
 import { ContinuityCapsuleSource } from './libs/agentEngine/coworkContinuityCapsule';
 
@@ -42,12 +47,14 @@ function setupDb(): void {
       id TEXT PRIMARY KEY,
       title TEXT NOT NULL,
       claude_session_id TEXT,
+      scheduled_task_id TEXT,
       status TEXT NOT NULL DEFAULT 'idle',
       pinned INTEGER NOT NULL DEFAULT 0,
       pin_order INTEGER,
       cwd TEXT NOT NULL,
       system_prompt TEXT NOT NULL DEFAULT '',
       model_override TEXT NOT NULL DEFAULT '',
+      thinking_level TEXT NOT NULL DEFAULT '',
       execution_mode TEXT NOT NULL DEFAULT 'local',
       active_skill_ids TEXT,
       agent_id TEXT DEFAULT 'main',
@@ -92,6 +99,7 @@ function setupDb(): void {
       system_prompt TEXT NOT NULL DEFAULT '',
       identity TEXT NOT NULL DEFAULT '',
       model TEXT NOT NULL DEFAULT '',
+      thinking_level TEXT NOT NULL DEFAULT '',
       working_directory TEXT NOT NULL DEFAULT '',
       icon TEXT NOT NULL DEFAULT '',
       skill_ids TEXT NOT NULL DEFAULT '[]',
@@ -217,6 +225,194 @@ test('getSession returns all messages when one has corrupt metadata', () => {
   expect(nullMsg.metadata).toBeUndefined();
 });
 
+test('getSessionSearchMessagePage keeps absolute mixed-message offsets without returning metadata or tool content', () => {
+  const sid = 'search-page-session';
+  insertSession(sid);
+
+  insertMessage('user-0', sid, 'user', 'first visible message', '{"localMediaAttachments":[{"localPath":"/large/path.png"}]}', 1);
+  insertMessage('tool-1', sid, 'tool_result', 'x'.repeat(20_000), '{"large":"metadata"}', 2);
+  insertMessage('thinking-2', sid, 'assistant', 'private chain of thought', '{"isThinking":true,"large":"metadata"}', 3);
+  insertMessage('assistant-3', sid, 'assistant', 'visible response', '{"large":"metadata"}', 4);
+  insertMessage('system-4', sid, 'system', 'large system payload', null, 5);
+  insertMessage('user-5', sid, 'user', 'last visible message', null, 6);
+
+  const countMessagesSpy = vi.spyOn(store, 'countSessionMessages');
+  const firstPage = store.getSessionSearchMessagePage(sid, 3, 0);
+  expect(firstPage).toEqual({
+    messages: [{
+      id: 'user-0',
+      type: 'user',
+      content: 'first visible message',
+      timestamp: expect.any(Number),
+      absoluteMessageIndex: 0,
+    }],
+    offset: 0,
+    nextOffset: 3,
+    nextCursor: {
+      sortValue: 3,
+      createdAt: expect.any(Number),
+      rowId: expect.any(Number),
+    },
+    total: 6,
+  });
+
+  expect(store.getSessionSearchMessagePage(
+    sid,
+    3,
+    3,
+    firstPage.nextCursor,
+    firstPage.total,
+  )).toEqual({
+    messages: [
+      {
+        id: 'assistant-3',
+        type: 'assistant',
+        content: 'visible response',
+        timestamp: expect.any(Number),
+        absoluteMessageIndex: 3,
+      },
+      {
+        id: 'user-5',
+        type: 'user',
+        content: 'last visible message',
+        timestamp: expect.any(Number),
+        absoluteMessageIndex: 5,
+      },
+    ],
+    offset: 3,
+    nextOffset: 6,
+    nextCursor: {
+      sortValue: 6,
+      createdAt: expect.any(Number),
+      rowId: expect.any(Number),
+    },
+    total: 6,
+  });
+  expect(countMessagesSpy).toHaveBeenCalledTimes(1);
+});
+
+test('getSessionSearchMessagePage treats corrupt assistant metadata as non-thinking', () => {
+  const sid = 'search-corrupt-metadata-session';
+  insertSession(sid);
+  insertMessage('assistant-corrupt', sid, 'assistant', 'still searchable', '{broken', 1);
+
+  expect(store.getSessionSearchMessagePage(sid, 10, 0).messages).toEqual([{
+    id: 'assistant-corrupt',
+    type: 'assistant',
+    content: 'still searchable',
+    timestamp: expect.any(Number),
+    absoluteMessageIndex: 0,
+  }]);
+});
+
+test('getSessionSearchMessagePage bounds user and assistant content while preserving an over-limit sentinel', () => {
+  const sid = 'search-content-limit-session';
+  insertSession(sid);
+  const projectedLength = COWORK_SEARCH_HISTORY_MAX_MESSAGE_CONTENT_CODE_UNITS + 1;
+  const userContent = `${'u'.repeat(projectedLength)}user tail`;
+  const assistantContent = `${'a'.repeat(projectedLength)}assistant tail`;
+  insertMessage('oversized-user', sid, 'user', userContent, null, 1);
+  insertMessage('oversized-assistant', sid, 'assistant', assistantContent, null, 2);
+
+  const messages = store.getSessionSearchMessagePage(sid, 10, 0).messages;
+
+  expect(messages).toHaveLength(2);
+  expect(messages[0].content).toBe(userContent.slice(0, projectedLength));
+  expect(messages[1].content).toBe(assistantContent.slice(0, projectedLength));
+  expect(messages.every(message => message.content.length === projectedLength)).toBe(true);
+});
+
+test('getSessionSearchMessagePage leaves UTF-16 surrogate overflow detectable by the renderer', () => {
+  const sid = 'search-surrogate-limit-session';
+  insertSession(sid);
+  const content = '🦞'.repeat(
+    Math.floor(COWORK_SEARCH_HISTORY_MAX_MESSAGE_CONTENT_CODE_UNITS / 2) + 1,
+  );
+  insertMessage('oversized-surrogate-user', sid, 'user', content, null, 1);
+
+  const [message] = store.getSessionSearchMessagePage(sid, 10, 0).messages;
+
+  // SQLite SUBSTR counts Unicode code points, while JavaScript String.length
+  // counts UTF-16 code units. Returning this bounded value still crosses the
+  // renderer's explicit per-message limit instead of silently truncating it.
+  expect(message.content).toBe(content);
+  expect(message.content.length).toBeGreaterThan(
+    COWORK_SEARCH_HISTORY_MAX_MESSAGE_CONTENT_CODE_UNITS,
+  );
+});
+
+test('getSessionSearchMessagePage enforces its aggregate UTF-8 payload budget without losing page progress', () => {
+  const sid = 'search-page-payload-limit-session';
+  insertSession(sid);
+  const fullSizeMessage = 'p'.repeat(
+    COWORK_SEARCH_HISTORY_MAX_MESSAGE_CONTENT_CODE_UNITS,
+  );
+  const messagesAtLimit = Math.floor(
+    COWORK_SEARCH_MESSAGE_PAGE_MAX_CONTENT_BYTES
+      / COWORK_SEARCH_HISTORY_MAX_MESSAGE_CONTENT_CODE_UNITS,
+  );
+  for (let index = 0; index < messagesAtLimit; index += 1) {
+    insertMessage(`payload-${index}`, sid, 'user', fullSizeMessage, null, index + 1);
+  }
+
+  const exactLimitPage = store.getSessionSearchMessagePage(sid, 20, 0);
+  expect(exactLimitPage.messages).toHaveLength(messagesAtLimit);
+  expect(exactLimitPage.messages.reduce(
+    (total, message) => total + Buffer.byteLength(message.content, 'utf8'),
+    0,
+  )).toBe(COWORK_SEARCH_MESSAGE_PAGE_MAX_CONTENT_BYTES);
+
+  insertMessage('payload-overflow', sid, 'user', 'x', null, messagesAtLimit + 1);
+  const overLimitPage = store.getSessionSearchMessagePage(sid, 20, 0);
+
+  expect(overLimitPage.messages).toEqual([{
+    id: 'payload-0',
+    type: 'user',
+    content: expect.any(String),
+    timestamp: expect.any(Number),
+    absoluteMessageIndex: 0,
+  }]);
+  expect(overLimitPage.messages[0].content).toHaveLength(
+    COWORK_SEARCH_HISTORY_MAX_MESSAGE_CONTENT_CODE_UNITS + 1,
+  );
+  expect(overLimitPage).toMatchObject({
+    offset: 0,
+    nextOffset: messagesAtLimit + 1,
+    nextCursor: {
+      sortValue: messagesAtLimit + 1,
+      createdAt: expect.any(Number),
+      rowId: expect.any(Number),
+    },
+    total: messagesAtLimit + 1,
+  });
+});
+
+test('getSessionSearchMessagePage keyset cursor preserves ROWID order for legacy ties', () => {
+  const sid = 'search-keyset-tie-session';
+  insertSession(sid);
+  for (let index = 0; index < 5; index += 1) {
+    insertMessage(`tie-${index}`, sid, 'user', `message ${index}`, null, index + 1, 100);
+  }
+  db.prepare('UPDATE cowork_messages SET sequence = NULL WHERE session_id = ?').run(sid);
+
+  const firstPage = store.getSessionSearchMessagePage(sid, 2, 0);
+  const secondPage = store.getSessionSearchMessagePage(sid, 2, 2, firstPage.nextCursor);
+  const thirdPage = store.getSessionSearchMessagePage(sid, 2, 4, secondPage.nextCursor);
+
+  expect([
+    ...firstPage.messages,
+    ...secondPage.messages,
+    ...thirdPage.messages,
+  ].map(message => [message.id, message.absoluteMessageIndex])).toEqual([
+    ['tie-0', 0],
+    ['tie-1', 1],
+    ['tie-2', 2],
+    ['tie-3', 3],
+    ['tie-4', 4],
+  ]);
+  expect(thirdPage.nextOffset).toBe(5);
+});
+
 test('searchSessions finds matching titles beyond the recent page', () => {
   for (let index = 0; index < 105; index += 1) {
     insertSession(`recent-${index}`, 'main', `Recent filler ${index}`, 2000 + index);
@@ -233,6 +429,54 @@ test('searchSessions finds matching titles beyond the recent page', () => {
 
   expect(results.map((session) => session.id)).toEqual(['deep-match']);
   expect(store.countSearchSessions({ query: 'history search needle' })).toBe(1);
+});
+
+test('scheduled task sessions preserve their task id in session details and list summaries', () => {
+  const session = store.createSession(
+    'Daily summary',
+    '/tmp',
+    '',
+    'local',
+    [],
+    'main',
+    '',
+    { scheduledTaskId: 'job-daily-summary' },
+  );
+
+  expect(session.scheduledTaskId).toBe('job-daily-summary');
+  expect(store.getSession(session.id)?.scheduledTaskId).toBe('job-daily-summary');
+  expect(store.listSessions(10, 0, 'main')[0]?.scheduledTaskId).toBe('job-daily-summary');
+  expect(store.searchSessions({ query: 'Daily summary' })[0]?.scheduledTaskId).toBe(
+    'job-daily-summary',
+  );
+
+  insertSession('newer-fork', 'main', 'Forked daily summary', Date.now() + 10_000);
+  db.prepare(
+    `UPDATE cowork_sessions
+     SET scheduled_task_id = ?, parent_session_id = ?
+     WHERE id = ?`,
+  ).run('job-daily-summary', session.id, 'newer-fork');
+
+  expect(store.getSessionIdByScheduledTaskId('job-daily-summary', 'main')).toBe(session.id);
+  expect(store.getSessionIdByScheduledTaskId('job-daily-summary', 'other-agent')).toBeNull();
+});
+
+test('scheduled task session lookup uses a stable newest-created top-level session', () => {
+  insertSession('older-session', 'main', 'Older daily summary', 1_000);
+  insertSession('newer-session', 'main', 'Newer daily summary', 2_000);
+  db.prepare(
+    `UPDATE cowork_sessions
+     SET scheduled_task_id = ?
+     WHERE id IN (?, ?)`,
+  ).run('job-daily-summary', 'older-session', 'newer-session');
+
+  // A user interaction may update an older history row. It must not change the
+  // canonical destination chosen for future scheduled runs.
+  db.prepare('UPDATE cowork_sessions SET updated_at = ? WHERE id = ?')
+    .run(3_000, 'older-session');
+
+  expect(store.getSessionIdByScheduledTaskId('job-daily-summary', 'main'))
+    .toBe('newer-session');
 });
 
 test('searchSessions preserves pinned ordering and pagination', () => {
@@ -636,6 +880,24 @@ test('updateSession can patch model override without refreshing the session upda
   expect(session?.updatedAt).toBe(1000);
 });
 
+test('create and update session persist the selected thinking level', () => {
+  const session = store.createSession(
+    'Thinking session',
+    '/tmp',
+    '',
+    'local',
+    [],
+    'main',
+    'lobsterai-server/deepseek-v4-flash',
+    { thinkingLevel: 'high' },
+  );
+
+  expect(store.getSession(session.id)?.thinkingLevel).toBe('high');
+
+  store.updateSession(session.id, { thinkingLevel: 'max' }, { touchUpdatedAt: false });
+  expect(store.getSession(session.id)?.thinkingLevel).toBe('max');
+});
+
 test('updateSession can rename without refreshing the session updated time', () => {
   const sid = 'sess-title-only';
   insertSession(sid);
@@ -665,7 +927,11 @@ test('deleteSession removes messages without relying on foreign key cascade', ()
 test('forkSession copies stable history and records fork metadata', () => {
   const sid = 'sess-fork-source';
   insertSession(sid);
-  insertMessage('msg-user', sid, 'user', 'start here', '{"keep":true}', 1, 1000);
+  insertMessage('msg-user', sid, 'user', 'start here', JSON.stringify({
+    keep: true,
+    [OpenClawCronRunMetadataKey.SessionKey]: 'agent:main:cron:job-1:run:run-1',
+    [OpenClawCronRunMetadataKey.EntryIndex]: 0,
+  }), 1, 1000);
   insertMessage(
     'msg-streaming',
     sid,
@@ -884,20 +1150,25 @@ test('forkSession prefers a new compaction bridge over an inherited summary', ()
   expect(summaries[0].content).toBe('Newer compacted context.');
 });
 
-test('agent CRUD stores working directory independently', () => {
+test('agent CRUD stores model preferences and working directory independently', () => {
   const agent = store.createAgent({
     name: 'Docs Agent',
     model: 'openai/gpt-4o',
+    thinkingLevel: 'high',
     workingDirectory: '/tmp/docs-project',
   });
 
+  expect(agent.thinkingLevel).toBe('high');
   expect(agent.workingDirectory).toBe('/tmp/docs-project');
 
   const updated = store.updateAgent(agent.id, {
+    thinkingLevel: 'max',
     workingDirectory: '/tmp/docs-next',
   });
 
+  expect(updated?.thinkingLevel).toBe('max');
   expect(updated?.workingDirectory).toBe('/tmp/docs-next');
+  expect(store.getAgent(agent.id)?.thinkingLevel).toBe('max');
   expect(store.getAgent(agent.id)?.workingDirectory).toBe('/tmp/docs-next');
 });
 

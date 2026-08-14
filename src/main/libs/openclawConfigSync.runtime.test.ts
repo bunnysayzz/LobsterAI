@@ -202,6 +202,31 @@ describe('OpenClawConfigSync runtime config output', () => {
     } as never);
   };
 
+  test('keys OpenClaw skill entries by frontmatter name, not directory id', async () => {
+    const sync = await createSync({
+      // Mirrors bundled skills whose SKILL.md frontmatter name differs from
+      // the directory-derived id (see issue #2441): OpenClaw resolves
+      // skills.entries overrides by frontmatter name only.
+      getSkillsList: () => [
+        { id: 'technology-news-search', name: 'technology-search', enabled: false },
+        { id: 'remotion', name: 'remotion-best-practices', enabled: false },
+        { id: 'weather', name: 'weather', enabled: true },
+      ],
+    });
+
+    const result = sync.sync('skill-entry-keys');
+    expect(result.ok).toBe(true);
+
+    const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    expect(config.skills.entries).toMatchObject({
+      'technology-search': { enabled: false },
+      'remotion-best-practices': { enabled: false },
+      weather: { enabled: true },
+    });
+    expect(config.skills.entries).not.toHaveProperty('technology-news-search');
+    expect(config.skills.entries).not.toHaveProperty('remotion');
+  });
+
   test('writes OpenClaw config fields required by LobsterAI patches', async () => {
     const legacyWorkingDirectory = path.join(tmpDir, 'legacy-working-directory');
     const mainAgentWorkingDirectory = path.join(tmpDir, 'main-agent-working-directory');
@@ -260,6 +285,32 @@ describe('OpenClawConfigSync runtime config output', () => {
 
     const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
     expect(config.models.pricing).toEqual({ enabled: false });
+  });
+
+  test('strips plugin-index-managed plugins.installs while preserving other plugins keys', async () => {
+    // A leaked plugins.installs on disk poisons config.set hot delivery
+    // (the gateway rejects the key) and makes the gateway self-restart on
+    // the file diff — sync must scrub it on every write.
+    fs.writeFileSync(configPath, `${JSON.stringify({
+      gateway: { mode: 'local', port: 18789 },
+      plugins: {
+        entries: { 'runtime-injected-plugin': { enabled: true } },
+        allow: ['runtime-injected-plugin'],
+        slots: { memory: 'memory-core' },
+        installs: { xai: { source: 'npm', version: '1.0.0' } },
+      },
+    }, null, 2)}\n`, 'utf8');
+    const sync = await createSync();
+
+    const result = sync.sync('installs-scrub');
+    expect(result.ok).toBe(true);
+
+    const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    expect(config.plugins.installs).toBeUndefined();
+    expect(config.plugins.entries['runtime-injected-plugin']).toEqual({ enabled: true });
+    expect(config.plugins.allow).toContain('runtime-injected-plugin');
+    expect(config.plugins.slots.memory).toBe('memory-core');
+    expect(config.gateway.port).toBe(18789);
   });
 
   test('defaults memory search to local FTS-only when embeddings are disabled', async () => {
@@ -1386,6 +1437,29 @@ describe('OpenClawConfigSync runtime config output', () => {
         },
       },
     })).toBe(false);
+    expect(modelCompatConfigChangeRequiresRestart(compatConfig, {
+      ...compatConfig,
+      plugins: {
+        entries: {
+          'lobsterai-model-compat': {
+            enabled: true,
+            config: {
+              modelProfiles: compatConfig.plugins.entries['lobsterai-model-compat'].config.modelProfiles,
+              thinkingProfiles: {
+                'lobsterai-server/deepseek-v4-flash': {
+                  options: [
+                    { level: 'off', openclawLevel: 'off' },
+                    { level: 'high', openclawLevel: 'high' },
+                    { level: 'max', openclawLevel: 'xhigh' },
+                  ],
+                  defaultLevel: 'high',
+                },
+              },
+            },
+          },
+        },
+      },
+    })).toBe(true);
   });
 
   test('assigns mixed-provider compatibility ownership independently of model order', async () => {
@@ -1472,6 +1546,98 @@ describe('OpenClawConfigSync runtime config output', () => {
         api: 'openai-completions',
       }),
     );
+  });
+
+  test('writes server thinking profiles without taking over the provider transport', async () => {
+    mockRuntimeState.proxyPort = 56646;
+    mockRuntimeState.serverModels = [{
+      modelId: 'deepseek-v4-flash',
+      modelName: 'DeepSeek V4 Flash',
+      apiFormat: 'openai',
+      supportsThinking: true,
+      thinkingConfig: {
+        options: [
+          { level: 'off', openclawLevel: 'off' },
+          { level: 'high', openclawLevel: 'high' },
+          { level: 'max', openclawLevel: 'xhigh' },
+        ],
+        defaultLevel: 'high',
+      },
+      requestCapabilities: ['lobsterai-options-v1'],
+    }];
+
+    const sync = await createSync();
+    expect(sync.sync('server-thinking-profile')).toMatchObject({ ok: true });
+
+    const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    expect(config.models.providers['lobsterai-server'].api).toBe('openai-completions');
+    expect(config.models.providers['lobsterai-server'].models[0]).toEqual(
+      expect.objectContaining({
+        thinkingLevelMap: {
+          off: 'off',
+          minimal: null,
+          low: null,
+          medium: null,
+          high: 'high',
+          xhigh: 'xhigh',
+        },
+        compat: expect.objectContaining({
+          supportsReasoningEffort: true,
+          supportedReasoningEfforts: ['high', 'xhigh'],
+        }),
+      }),
+    );
+    expect(config.plugins.entries['lobsterai-model-compat']).toEqual({
+      enabled: true,
+      config: {
+        thinkingProfiles: {
+          'lobsterai-server/deepseek-v4-flash': {
+            options: [
+              { level: 'off', openclawLevel: 'off' },
+              { level: 'high', openclawLevel: 'high' },
+              { level: 'max', openclawLevel: 'xhigh' },
+            ],
+            defaultLevel: 'high',
+            requestOptionsVersion: 1,
+          },
+        },
+      },
+    });
+    expect(config.plugins.allow).toContain('lobsterai-model-compat');
+  });
+
+  test('keeps legacy thinking transport when the server does not advertise request options', async () => {
+    mockRuntimeState.proxyPort = 56646;
+    mockRuntimeState.serverModels = [{
+      modelId: 'deepseek-v4-flash',
+      modelName: 'DeepSeek V4 Flash',
+      apiFormat: 'openai',
+      supportsThinking: true,
+      thinkingConfig: {
+        options: [
+          { level: 'off', openclawLevel: 'off' },
+          { level: 'high', openclawLevel: 'high' },
+          { level: 'max', openclawLevel: 'xhigh' },
+        ],
+        defaultLevel: 'high',
+      },
+    }];
+
+    const sync = await createSync();
+    expect(sync.sync('legacy-server-thinking-profile')).toMatchObject({ ok: true });
+
+    const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    expect(
+      config.plugins.entries['lobsterai-model-compat']
+        .config.thinkingProfiles['lobsterai-server/deepseek-v4-flash'],
+    ).toEqual({
+      options: [
+        { level: 'off', openclawLevel: 'off' },
+        { level: 'high', openclawLevel: 'high' },
+        { level: 'max', openclawLevel: 'xhigh' },
+      ],
+      defaultLevel: 'high',
+    });
   });
 
   test('fails closed when the Kimi K3 compatibility extension is unavailable', async () => {
@@ -2654,14 +2820,14 @@ describe('OpenClawConfigSync runtime config output', () => {
     const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
     expect(config.tools.loopDetection).toEqual({
       enabled: true,
-      historySize: 40,
+      historySize: 48,
       warningThreshold: 6,
       unknownToolThreshold: 6,
       criticalThreshold: 10,
-      globalCircuitBreakerThreshold: 16,
+      globalCircuitBreakerThreshold: 30,
       detectors: {
         genericRepeat: true,
-        knownPollNoProgress: true,
+        knownPollNoProgress: false,
         pingPong: true,
       },
     });
